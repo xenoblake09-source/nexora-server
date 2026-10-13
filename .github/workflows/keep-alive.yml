@@ -1,0 +1,12 @@
+name: keep-server-awake
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping NEXORA /health
+        run: curl -fsS --max-time 60 "https://nexora-server-adqx.onrender.com/health" > /dev/null
