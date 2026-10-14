@@ -1,8 +1,14 @@
 """NEXORA AI backend - single-file deploy bundle (Render free tier ke liye).
 
-Yeh file wahi kaam karti hai jo nexora-phase3/backend/app/ ke 4 modules milkar karte
-hain (config + providers + sessions + api). AI key yahan nahi likhi - woh Render ke
-"Environment Variables" me daali jaati hai (GEMINI_API_KEY).
+Yeh file nexora-phase3/backend/app/ ke 5 modules ko ek me jodti hai:
+config + providers + sessions + websearch + api. AI key yahan nahi likhi - woh Render ke
+"Environment Variables" me daali jaati hai (OPENAI_API_KEY / GEMINI_API_KEY).
+
+Is version me (14 Oct update):
+  * LIVE INFO: mausam (open-meteo), taaza khabar (Google News RSS) aur facts (Wikipedia)
+    bina kisi API key ke. Sirf zaroorat par chalta hai; fail ho to jawaab rukta nahi.
+  * clean_reply: emoji/markdown/dash hata deta hai (TTS ke liye).
+  * "language" reply ke script se banta hai (Devanagari -> Hindi voice).
 
 Start command (Render):  uvicorn app:app --host 0.0.0.0 --port $PORT
 """
@@ -19,21 +25,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are NEXORA, a small cute robot pet living in a handmade cardboard body at a school "
-    "exhibition. You are warm, playful and a little funny, like a tiny robot friend who is happy "
-    "to help. "
-    "Answer in the SAME language the user used: English, Hindi (Devanagari) or Hinglish (Roman "
-    "Hindi). "
-    "Keep every answer short and catchy: 1 to 2 simple sentences that sound great when spoken "
-    "aloud. "
-    "One tiny playful touch (a fun comparison or a light joke) is welcome, but never at the cost "
-    "of being correct. "
-    "Explain school topics simply, with one everyday example. "
-    "If you do not know something, say so honestly instead of inventing facts. "
-    "You have no camera yet: never claim to have seen anything unless an image was actually "
-    "provided. "
-    "Never output emojis, markdown, code blocks or long lists - your words are spoken by a voice. "
-    "Refuse politely if asked to help with anything unsafe, hateful or illegal."
+    # NEXORA ki personality + sakht rules. Yeh lines phone ke TTS voice ke liye likhi gayi
+    # hain: chhota jawaab, ek hi script, koi emoji/markdown/extra line nahi.
+    "You are NEXORA, a small cute robot pet in a handmade cardboard body at a school exhibition. "
+    "Your words are read aloud by a phone voice, so they must sound natural when spoken. "
+    "Follow these rules exactly:\n"
+    "1. Answer the user's real question in the FIRST sentence. Never dodge an answer or replace it "
+    "with a joke.\n"
+    "2. Stay very short: 1 or 2 sentences, at most about 25 words in total.\n"
+    "3. Use ONE script only. If the user speaks English, answer in English. If the user speaks "
+    "Hindi or Hinglish, answer in simple everyday Hindi using DEVANAGARI letters only, with no "
+    "Roman Hindi mixed in.\n"
+    "4. No extra lines: no greeting at the start, no closing question, no offer of more help, no "
+    "repeating the question, no stage directions in brackets.\n"
+    "5. A light playful tone is welcome inside those 1-2 sentences, but for maths, definitions and "
+    "facts give the plain answer first.\n"
+    "6. Plain spoken text only: no emojis, no markdown, no asterisks, no quotes, no dashes, no "
+    "numbered lists.\n"
+    "7. Never invent facts. If you do not know, say in one short sentence that you do not know.\n"
+    "8. You have no camera yet: never claim to have seen anything.\n"
+    "9. Refuse politely in one sentence if asked for anything unsafe, hateful or illegal."
 )
 
 
@@ -89,6 +100,9 @@ class Settings:
     max_input_chars: int
     max_reply_tokens: int
     system_prompt: str
+    web_search: bool
+    city: str
+    search_timeout_s: float
 
     @property
     def provider_ready(self) -> bool:
@@ -138,6 +152,9 @@ def get_settings() -> Settings:
         max_history_messages=_as_int("MAX_HISTORY_MESSAGES", 8, 2),
         max_input_chars=_as_int("MAX_INPUT_CHARS", 500, 50),
         max_reply_tokens=_as_int("MAX_REPLY_TOKENS", 220, 40),
+        web_search=os.getenv("WEB_SEARCH", "1").strip() != "0",
+        city=os.getenv("CITY", "Patna").strip() or "Patna",
+        search_timeout_s=_as_float("SEARCH_TIMEOUT_S", 8.0, 3.0),
         system_prompt=os.getenv("SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT,
     )
 
@@ -240,9 +257,9 @@ class GeminiProvider:
 
 
 def _uses_completion_tokens(model: str) -> bool:
-    """gpt-5 / o-series reasoning models reject max_tokens and a custom temperature."""
+    """Reasoning models (gpt-5 / o-series / open-weight gpt-oss) need max_completion_tokens."""
     name = (model or "").strip().lower()
-    return name.startswith(("gpt-5", "o1", "o3", "o4", "o5"))
+    return name.startswith(("gpt-5", "o1", "o3", "o4", "o5")) or "gpt-oss" in name
 
 
 class OpenAiCompatibleProvider:
@@ -266,6 +283,8 @@ class OpenAiCompatibleProvider:
         if _uses_completion_tokens(self.model):
             # Reasoning models count hidden reasoning tokens too, so leave headroom.
             payload["max_completion_tokens"] = max(2000, self._max_tokens * 8)
+            if "gpt-oss" in self.model.lower():
+                payload["reasoning_effort"] = "low"  # Groq gpt-oss: short robot replies
         else:
             payload["temperature"] = 0.6
             payload["max_tokens"] = self._max_tokens
@@ -413,6 +432,255 @@ class RateLimiter:
         self._day[token] = day
         return True, 0
 
+# ===================== merged from app/websearch.py =====================
+"""Live internet info: mausam, taaza khabar aur facts - sab bina kisi API key ke.
+
+Kyun: AI model purane data se seekha hai, isliye "aaj ka mausam" jaisa sawaal woh
+nahi bata sakta. Yeh module sawaal padh kar siraf zaroori jagah internet se taaza
+jaankari laata hai aur usse prompt me daal deta hai. Search fail ho jaye to koi
+error nahi - normal jawaab hi chalta hai (feature transparent rehta hai).
+
+Sources (sab free, koi key nahi):
+  * Mausam  -> open-meteo.com (geocoding + forecast), fallback wttr.in
+  * Khabar  -> Google News RSS search
+  * Facts   -> Wikipedia search API (Devanagari sawaal ke liye hi.wikipedia)
+"""
+
+import asyncio
+import html
+import re
+from urllib.parse import quote
+
+import httpx
+
+# ---------------------------------------------------------------- sawaal padhna
+
+_WEATHER_TRIGGERS = (
+    "mausam", "weather", "barish", "baarish", "barish", "garmi", "sardi", "temperature",
+    "tapman", "humidity", "umbrella", "chhata", "chhaata", "dhoop", "dhup", "toofan",
+    "rain", "monsoon", "sardi", "गर्मी", "सर्दी", "बारिश", "मौसम", "बादल", "धूप",
+)
+_NEWS_TRIGGERS = (
+    "khabar", "khabren", "khabrein", "news", "samachar", "latest", "taaza", "taza",
+    "abhi ka", "current", "kya hua", "kaun jeeta", "jeeta", "jeet gaya", "match",
+    "score", "result", "election", "chunav", "cricket", "ipl", "share bazar",
+    "stock", "bhav", "trending", "record banaya", "खबर", "ख़बर", "समाचार", "ताज़ा",
+    "नतीजा", "चुनाव", "मैच", "स्कोर",
+)
+_SEARCH_TRIGGERS = (
+    "search karo", "google karo", "internet par", "online", "dhundo", "dhoondo",
+    "pata karo", "check karo", "dekho internet", "सर्च करो", "गूगल करो", "इंटरनेट",
+)
+_YEAR = re.compile(r"\b(20[2-9]\d)\b")
+_DEVANAGARI = re.compile(r"[\u0900-\u097f]")
+
+# Chhota city list: sawaal me naam mile to wahi, warna NEXORA_CITY (default Patna).
+_CITIES = (
+    "patna", "delhi", "mumbai", "kolkata", "chennai", "bengaluru", "bangalore",
+    "hyderabad", "lucknow", "jaipur", "gaya", "varanasi", "banaras", "ranchi",
+    "bhopal", "indore", "pune", "ahmedabad", "surat", "noida", "gurgaon", "kanpur",
+    "agra", "srinagar", "goa", "dubai", "london", "tokyo", "paris", "new york",
+    "singapore", "पटना", "दिल्ली", "मुंबई", "कोलकाता", "लखनऊ", "गया", "वाराणसी",
+)
+
+
+def wants_live_info(text: str) -> bool:
+    """Sawaal me taaza jaankari chahiye? (warna normal, fast jawaab hi chalta hai)"""
+    low = text.lower()
+    if any(t in low for t in _SEARCH_TRIGGERS):
+        return True
+    if any(t in low for t in _WEATHER_TRIGGERS) or any(t in text for t in _WEATHER_TRIGGERS):
+        return True
+    if any(t in low for t in _NEWS_TRIGGERS) or any(t in text for t in _NEWS_TRIGGERS):
+        return True
+    return bool(_YEAR.search(low))
+
+
+def city_from_text(text: str, default_city: str) -> str:
+    low = text.lower()
+    for city in _CITIES:
+        if city in low or city in text:
+            return city.title() if city.isascii() else city
+    return default_city
+
+
+def wants_weather(text: str) -> bool:
+    low = text.lower()
+    return any(t in low for t in _WEATHER_TRIGGERS) or any(t in text for t in _WEATHER_TRIGGERS)
+
+
+def wants_news(text: str) -> bool:
+    low = text.lower()
+    return (any(t in low for t in _NEWS_TRIGGERS) or any(t in text for t in _NEWS_TRIGGERS)
+            or bool(_YEAR.search(low)))
+
+
+# ---------------------------------------------------------------- helpers
+
+def _strip_html(value: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", " ", value or "")).strip()
+
+
+def _short(value: str, limit: int) -> str:
+    value = re.sub(r"\s+", " ", value).strip()
+    return value if len(value) <= limit else value[:limit].rsplit(" ", 1)[0] + "..."
+
+
+_WEATHER_CODES = {
+    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "fog", 48: "fog", 51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "freezing drizzle", 57: "freezing drizzle", 61: "light rain", 63: "rain",
+    65: "heavy rain", 66: "freezing rain", 67: "freezing rain", 71: "light snow",
+    73: "snow", 75: "heavy snow", 77: "snow grains", 80: "light showers", 81: "showers",
+    82: "violent showers", 85: "snow showers", 86: "snow showers", 95: "thunderstorm",
+    96: "thunderstorm with hail", 99: "thunderstorm with hail",
+}
+
+
+# ---------------------------------------------------------------- sources
+
+def weather_text(city: str, current: dict, daily: dict) -> str | None:
+    """open-meteo ke JSON se bolne wali line. Pure function - isliye test karna aasaan.
+
+    Dhyan: weather_code 0 (saaf aasmaan) valid hai, isliye `or` ke bajaye None check.
+    """
+    temp = current.get("temperature_2m")
+    if temp is None:
+        return None
+    code = current.get("weather_code")
+    desc = _WEATHER_CODES.get(int(code), "unclear") if code is not None else "unclear"
+    highs = daily.get("temperature_2m_max") or [None]
+    lows = daily.get("temperature_2m_min") or [None]
+    line = (f"{city} weather right now: {temp} C, {desc}, "
+            f"humidity {current.get('relative_humidity_2m')}%, "
+            f"wind {current.get('wind_speed_10m')} km/h")
+    if highs[0] is not None and lows[0] is not None:
+        line += f", today max {highs[0]} C / min {lows[0]} C"
+    return line
+
+
+# News search me sawaal ke bhare hue shabd hata dete hain, taaki topic saaf rahe.
+_NEWS_STOPWORDS = {
+    "hey", "nexora", "sunao", "sunaye", "suna", "batao", "bata", "do", "ka", "ki", "ke",
+    "ko", "me", "mein", "hai", "hain", "kya", "kaun", "aaj", "par", "se", "aur", "is",
+    "the", "a", "an", "of", "tell", "me", "about", "today", "news", "khabar", "khabren",
+    "khabrein", "taaza", "taza", "latest", "please", "abhi", "current",
+    "आज", "की", "का", "के", "को", "में", "है", "हैं", "सुनाओ", "बताओ", "खबर", "ख़बर",
+    "ताज़ा", "न्यूज़", "समाचार",
+}
+
+
+def news_query(text: str) -> str:
+    """Google News ke liye chhota query; when:2d se sirf taaza (2 din ke andar) khabrein."""
+    cleaned = re.sub(r"[^\w\s\u0900-\u097f]", " ", text.lower())
+    tokens = [t for t in cleaned.split() if len(t) > 1 and t not in _NEWS_STOPWORDS]
+    topic = " ".join(tokens[:8]).strip()
+    return (topic or "India") + " when:2d"
+
+
+async def weather_line(city: str, timeout: float) -> str | None:
+    """Aaj ka mausam. Pehla source open-meteo; na chale to wttr.in."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                     headers={"User-Agent": "NEXORA-robot/1.0"}) as client:
+            geo = await client.get("https://geocoding-api.open-meteo.com/v1/search",
+                                   params={"name": city, "count": 1})
+            results = (geo.json() or {}).get("results") or []
+            if results:
+                lat, lon = results[0]["latitude"], results[0]["longitude"]
+                fc = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": lat, "longitude": lon,
+                        "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
+                        "daily": "temperature_2m_max,temperature_2m_min",
+                        "timezone": "auto", "forecast_days": 1,
+                    },
+                )
+                data = fc.json() or {}
+                text = weather_text(city, data.get("current") or {}, data.get("daily") or {})
+                if text:
+                    return text
+    except Exception:  # noqa: BLE001 - search kabhi jawaab ko na roke
+        pass
+    try:  # fallback
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "curl/8"}) as client:
+            r = await client.get(f"https://wttr.in/{quote(city)}", params={"format": "j1"})
+            cur = ((r.json() or {}).get("current_condition") or [{}])[0]
+            if cur.get("temp_C"):
+                desc = ((cur.get("weatherDesc") or [{}])[0].get("value") or "").strip()
+                return (f"{city} weather right now: {cur['temp_C']} C, {desc}, "
+                        f"humidity {cur.get('humidity')}%")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+async def news_lines(query: str, timeout: float, limit: int = 4) -> list[str]:
+    """Google News RSS - aaj ki khabrein. Koi key nahi chahiye."""
+    try:
+        url = ("https://news.google.com/rss/search?q=" + quote(news_query(query))
+               + "&hl=en-IN&gl=IN&ceid=IN:en")
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(url)
+        items = re.findall(r"<item>(.*?)</item>", r.text, re.S)[:limit]
+        out = []
+        for item in items:
+            title = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", item, re.S)
+            date = re.search(r"<pubDate>(.*?)</pubDate>", item, re.S)
+            when = _short((date.group(1) if date else "").replace("GMT", "").strip(), 22)
+            if title:
+                out.append(f"News headline ({when}): {_short(_strip_html(title.group(1)), 160)}")
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def wiki_lines(query: str, timeout: float, limit: int = 2) -> list[str]:
+    """Wikipedia se seedha summary (facts ke liye sabse bharosemand)."""
+    host = "hi.wikipedia.org" if _DEVANAGARI.search(query) else "en.wikipedia.org"
+    try:
+        params = {
+            "action": "query", "generator": "search", "gsrsearch": query,
+            "gsrlimit": str(limit), "prop": "extracts", "exintro": "1",
+            "explaintext": "1", "format": "json", "redirects": "1",
+        }
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                     headers={"User-Agent": "NEXORA-robot/1.0"}) as client:
+            r = await client.get(f"https://{host}/w/api.php", params=params)
+        pages = ((r.json() or {}).get("query") or {}).get("pages") or {}
+        out = []
+        for page in list(pages.values())[:limit]:
+            extract = _short(_strip_html(page.get("extract") or ""), 300)
+            if extract:
+                out.append(f"Reference ({page.get('title', '')}): {extract}")
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def live_context(text: str, default_city: str, timeout: float = 8.0) -> str | None:
+    """Sawaal ke hisaab se taaza jaankari laao. Kuch na mile to None."""
+    jobs = []
+    if wants_weather(text):
+        jobs.append(weather_line(city_from_text(text, default_city), timeout))
+    if wants_news(text):
+        jobs.append(news_lines(text, timeout))
+    if not jobs:  # koi khaas trigger nahi: Wikipedia facts
+        jobs.append(wiki_lines(text, timeout))
+    results = await asyncio.gather(*jobs, return_exceptions=True)
+
+    lines: list[str] = []
+    for result in results:
+        if isinstance(result, str):
+            lines.append(result)
+        elif isinstance(result, list):
+            lines.extend(result)
+    # Bahut chhota context rakhte hain: prompt sasta aur jawaab tez rehta hai.
+    lines = [ln for ln in lines if ln.strip()][:5]
+    return "\n".join(f"- {ln}" for ln in lines) if lines else None
+
 # ===================== merged from app/main.py =====================
 """NEXORA backend API.
 
@@ -420,8 +688,10 @@ Phone  ->  this service (HTTPS + device token)  ->  AI provider (key stays here)
 Run with ONE worker because conversation context is in memory.
 """
 
+import asyncio
 import hmac
 import logging
+import re
 import time
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -444,6 +714,42 @@ def provider():
     if _provider is None:
         _provider = build_provider(settings)  # raises ProviderError when not configured
     return _provider
+
+
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF\U00002B00-\U00002BFF"
+    "\uFE0F\u200D\u2022]")
+_MARKDOWN_RE = re.compile(r"[*_#`~|<>]+")
+_PUNCT_MAP = str.maketrans({
+    "\u2014": ", ", "\u2013": ", ", "\u2012": "-", "\u2010": "-", "\u2011": "-",
+    "\u2018": "'", "\u2019": "'", "\u201c": "", "\u201d": "", "\u2026": "...",
+    "\u00a0": " ", "\u200b": "", "\u00ad": "",
+})
+
+
+def clean_reply(text: str) -> str:
+    """Bolta hua text hi bhejna hai: emoji, markdown aur ajeeb punctuation hata do.
+
+    Dashes/curly quotes ko phone ke TTS engines kabhi kabhi "dash" ya "quote" bol dete hain,
+    isliye unhe simple characters me badal dete hain. Newlines ko space bana dete hain warna
+    voice beech me lambe pause leta hai.
+    """
+    cleaned = text.translate(_PUNCT_MAP)
+    cleaned = _EMOJI_RE.sub("", cleaned)
+    cleaned = _MARKDOWN_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s*\n+\s*", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.?!;:\u0964])", r"\1", cleaned)  # "hai !" -> "hai!"
+    return cleaned[:600].strip()
+
+
+# Jab internet se taaza jaankari mil jaye, tab prompt me yeh judta hai.
+LIVE_PROMPT_SUFFIX = (
+    "\n\nLIVE INFORMATION just fetched from the internet:\n{info}\n"
+    "Use this live information to answer the question. Quote the numbers and names from it. "
+    "If the answer is not in the live information, say honestly in ONE short sentence that you "
+    "could not find it right now."
+)
 
 
 class ChatRequest(BaseModel):
@@ -502,9 +808,22 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
     session_id, history = sessions.history(request.session_id)
     messages = history + [{"role": "user", "content": text}]
 
+    # Taaza jaankari sirf tab jab sawaal ko zaroorat ho (warna normal fast jawaab).
+    live = None
+    if settings.web_search and wants_live_info(text):
+        try:
+            live = await asyncio.wait_for(
+                live_context(text, settings.city, settings.search_timeout_s),
+                timeout=settings.search_timeout_s + 5.0)
+        except Exception:  # noqa: BLE001 - search fail ho to jawaab rukna nahi chahiye
+            live = None
+        if live:
+            logger.info("live info added (%d chars)", len(live))
+
+    prompt = settings.system_prompt + (LIVE_PROMPT_SUFFIX.format(info=live) if live else "")
     try:
         answer = await with_timeout(
-            active.reply(settings.system_prompt, messages), settings.request_timeout_s)
+            active.reply(prompt, messages), settings.request_timeout_s)
     except ProviderError as exc:
         logger.warning("provider failure: %s", exc.kind)
         status = {
@@ -522,7 +841,7 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
         logger.exception("unexpected provider error")
         raise HTTPException(status_code=502, detail="provider_error") from None
 
-    answer = answer.strip()
+    answer = clean_reply(answer.strip())
     if not answer:
         raise HTTPException(status_code=502, detail="provider_empty")
 
@@ -531,9 +850,12 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
     logger.info("chat ok session=%s chars=%d", session_id[:8], len(answer))
     return {
         "reply": answer,
-        "language": guess_language(text),
+        # Phone is se apni TTS voice chunta hai, aur use REPLY ka script chahiye
+        # (user ke sawaal ka nahi): Devanagari jawaab -> Hindi voice, warna English voice.
+        "language": guess_language(answer),
         "session_id": session_id,
         "model": active.model,
+        "live": bool(live),  # app isko dikhata nahi; debugging ke liye hai
     }
 
 
@@ -564,6 +886,27 @@ async def home() -> HTMLResponse:
 <body style="font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;text-align:center;padding:40px">
 <h1 style="margin:0 0 6px">NEXORA server chal raha hai</h1>
 <p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model}</p>
+<p style="font-size:20px"><span style="color:{dot};font-size:28px">&#9679;</span> {state}</p>
+<p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> par poora status JSON milta hai</p>
+</body></html>"""
+    return HTMLResponse(html)
+
+# ---------------------------------------------------------------- friendly home page
+@app.get("/", include_in_schema=False)
+async def home() -> HTMLResponse:
+    """Chhota sa page: browser me khol ke turant pata chal jaata hai ki server chalu hai."""
+    ready = settings.provider_ready
+    try:
+        provider()
+    except ProviderError:
+        ready = False
+    dot = "#16a34a" if ready else "#dc2626"
+    state = "AI BRAIN READY - bol ke dekho!" if ready else "AI key nahi mili - Render -> Environment me key daalo"
+    live = "ON" if settings.web_search else "OFF"
+    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>NEXORA server</title></head>
+<body style="font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;text-align:center;padding:40px">
+<h1 style="margin:0 0 6px">NEXORA server chal raha hai</h1>
+<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live}</p>
 <p style="font-size:20px"><span style="color:{dot};font-size:28px">&#9679;</span> {state}</p>
 <p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> par poora status JSON milta hai</p>
 </body></html>"""
