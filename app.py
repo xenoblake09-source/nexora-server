@@ -1,14 +1,15 @@
 """NEXORA AI backend - single-file deploy bundle (Render free tier ke liye).
 
-Yeh file nexora-phase3/backend/app/ ke 5 modules ko ek me jodti hai:
+Yeh file nexora-phase3/backend/app/ ke saare modules ek me jodti hai:
 config + providers + sessions + websearch + api. AI key yahan nahi likhi - woh Render ke
 "Environment Variables" me daali jaati hai (OPENAI_API_KEY / GEMINI_API_KEY).
 
 Is version me (14 Oct update):
-  * LIVE INFO: mausam (open-meteo), taaza khabar (Google News RSS) aur facts (Wikipedia)
-    bina kisi API key ke. Sirf zaroorat par chalta hai; fail ho to jawaab rukta nahi.
-  * clean_reply: emoji/markdown/dash hata deta hai (TTS ke liye).
-  * "language" reply ke script se banta hai (Devanagari -> Hindi voice).
+  * user_name (optional): phone app naam bhejti hai to robot usse pyaar se bula sakta hai.
+    Server naam ko store NAHI karta - sirf usi request ke prompt me jaata hai.
+  * /v1/vision - on-demand camera: ek tasveer + ek sawaal -> chhota jawaab (tasveer save nahi hoti).
+  * LIVE INFO: mausam (open-meteo), khabar (Google News RSS), facts (Wikipedia) - bina key.
+  * clean_reply: emoji/markdown/dash hataata hai; language reply ke script se banti hai.
 
 Start command (Render):  uvicorn app:app --host 0.0.0.0 --port $PORT
 """
@@ -62,6 +63,14 @@ def _as_float(name: str, default: float, minimum: float = 0.0) -> float:
         return default
 
 
+# Groq/OpenAI-style vision models. Groq apne catalog badalta rehta hai, isliye server
+# list me se pehla chalne wala chun leta hai (providers.VisionRouter).
+DEFAULT_VISION_MODELS = (
+    "qwen/qwen3.8-27b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+)
+
 _PROVIDER_ALIASES = {
     "openai": "openai_compatible",
     "openai_api": "openai_compatible",
@@ -103,6 +112,10 @@ class Settings:
     web_search: bool
     city: str
     search_timeout_s: float
+    vision_enabled: bool
+    vision_models: tuple
+    max_image_bytes: int
+    vision_timeout_s: float
 
     @property
     def provider_ready(self) -> bool:
@@ -133,8 +146,16 @@ def get_settings() -> Settings:
             if raw_provider in _OPENAI_NATIVE_ALIASES
             else "https://api.groq.com/openai/v1"
         )
+    provider = _PROVIDER_ALIASES.get(raw_provider, raw_provider)
+    raw_vision = os.getenv("VISION_MODELS", "").strip()
+    if raw_vision:
+        vision_models = tuple(part.strip() for part in raw_vision.split(",") if part.strip())
+    elif provider == "gemini":
+        vision_models = (os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip(),)
+    else:
+        vision_models = DEFAULT_VISION_MODELS
     return Settings(
-        provider=_PROVIDER_ALIASES.get(raw_provider, raw_provider),
+        provider=provider,
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip(),
         gemini_base_url=os.getenv(
@@ -155,6 +176,10 @@ def get_settings() -> Settings:
         web_search=os.getenv("WEB_SEARCH", "1").strip() != "0",
         city=os.getenv("CITY", "Patna").strip() or "Patna",
         search_timeout_s=_as_float("SEARCH_TIMEOUT_S", 8.0, 3.0),
+        vision_enabled=os.getenv("VISION_ENABLED", "1").strip() != "0",
+        vision_models=vision_models,
+        max_image_bytes=_as_int("MAX_IMAGE_BYTES", 350000, 20000),
+        vision_timeout_s=_as_float("VISION_TIMEOUT_S", 40.0, 10.0),
         system_prompt=os.getenv("SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT,
     )
 
@@ -177,6 +202,7 @@ class ProviderError(Exception):
     SERVER = "server"
     BAD_RESPONSE = "bad_response"
     NOT_CONFIGURED = "not_configured"
+    MODEL_NOT_FOUND = "model_not_found"  # model retire ho gaya -> router agla model try kare
 
     def __init__(self, kind: str, message: str = "") -> None:
         super().__init__(message or kind)
@@ -247,7 +273,43 @@ class GeminiProvider:
             raise ProviderError(ProviderError.BAD_RESPONSE, "empty reply")
         return text
 
+    async def vision_reply(self, system_prompt: str, question: str,
+                           image_b64: str, mime: str = "image/jpeg") -> str:
+        """Tasveer + sawaal Gemini ko. (Flash models image dekh lete hain.)"""
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": question},
+                    {"inline_data": {"mime_type": mime, "data": image_b64}},
+                ],
+            }],
+            "generationConfig": {"temperature": 0.4, "maxOutputTokens": self._max_tokens},
+        }
+        url = f"{self._base}/models/{self.model}:generateContent"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(
+                    url, json=payload, headers={"x-goog-api-key": self._api_key},
+                    params={"key": self._api_key})
+        except httpx.TimeoutException as exc:
+            raise ProviderError(ProviderError.TIMEOUT, str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(ProviderError.NETWORK, str(exc)) from exc
+        self._raise_for_status(response.status_code)
+        try:
+            parts = response.json()["candidates"][0]["content"]["parts"]
+            text = " ".join(part.get("text", "") for part in parts).strip()
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(ProviderError.BAD_RESPONSE, str(exc)) from exc
+        if not text:
+            raise ProviderError(ProviderError.BAD_RESPONSE, "empty reply")
+        return text
+
     def _raise_for_status(self, status: int) -> None:
+        if status == 404:
+            raise ProviderError(ProviderError.MODEL_NOT_FOUND, f"model missing ({status})")
         if status in (401, 403):
             raise ProviderError(ProviderError.AUTH, f"provider auth failed ({status})")
         if status == 429:
@@ -300,6 +362,9 @@ class OpenAiCompatibleProvider:
             raise ProviderError(ProviderError.TIMEOUT, str(exc)) from exc
         except httpx.HTTPError as exc:
             raise ProviderError(ProviderError.NETWORK, str(exc)) from exc
+        if response.status_code == 404:
+            raise ProviderError(ProviderError.MODEL_NOT_FOUND,
+                                f"model not available ({response.status_code})")
         if response.status_code in (401, 403):
             raise ProviderError(ProviderError.AUTH, f"provider auth failed ({response.status_code})")
         if response.status_code == 429:
@@ -312,6 +377,111 @@ class OpenAiCompatibleProvider:
             return response.json()["choices"][0]["message"]["content"].strip()
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(ProviderError.BAD_RESPONSE, str(exc)) from exc
+
+
+    def vision_payload(self, system_prompt: str, question: str, image_b64: str,
+                       mime: str = "image/jpeg") -> dict:
+        """Tasveer wali request (OpenAI-style chat completions)."""
+        return {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
+                ]},
+            ],
+            "temperature": 0.4,
+            "max_tokens": self._max_tokens,
+        }
+
+    async def vision_reply(self, system_prompt: str, question: str,
+                           image_b64: str, mime: str = "image/jpeg") -> str:
+        payload = self.vision_payload(system_prompt, question, image_b64, mime)
+        headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(f"{self._base}/chat/completions",
+                                             json=payload, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise ProviderError(ProviderError.TIMEOUT, str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(ProviderError.NETWORK, str(exc)) from exc
+        if response.status_code == 404:
+            raise ProviderError(ProviderError.MODEL_NOT_FOUND, "vision model not available")
+        if response.status_code in (401, 403):
+            raise ProviderError(ProviderError.AUTH, f"provider auth failed ({response.status_code})")
+        if response.status_code == 429:
+            raise ProviderError(ProviderError.RATE_LIMIT, "provider rate limited")
+        if response.status_code >= 500:
+            raise ProviderError(ProviderError.SERVER, f"provider error ({response.status_code})")
+        if response.status_code >= 400:
+            raise ProviderError(ProviderError.BAD_RESPONSE,
+                                f"vision request rejected ({response.status_code})")
+        try:
+            return response.json()["choices"][0]["message"]["content"].strip()
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(ProviderError.BAD_RESPONSE, str(exc)) from exc
+
+
+class VisionRouter:
+    """Ek se zyada vision model try karta hai.
+
+    Kyun: free providers (jaise Groq) apne vision models badalte rehte hain. Hum candidate
+    list me se pehla chalne wala model chun lete hain aur use yaad rakhte hain; model retire
+    ho jaye (404) to apne aap agla try hota hai - server dobara deploy karne ki zaroorat nahi.
+    """
+
+    name = "vision"
+
+    def __init__(self, settings) -> None:
+        self._settings = settings
+        self.model = settings.vision_models[0] if settings.vision_models else "unknown"
+        self._locked: str | None = None
+
+    def _candidates(self) -> list[str]:
+        return [self._locked] if self._locked else list(self._settings.vision_models)
+
+    def _build(self, model: str):
+        if self._settings.provider == "gemini":
+            return GeminiProvider(self._settings.gemini_api_key, model,
+                                  self._settings.gemini_base_url,
+                                  self._settings.vision_timeout_s,
+                                  self._settings.max_reply_tokens)
+        return OpenAiCompatibleProvider(self._settings.openai_api_key, model,
+                                        self._settings.openai_base_url,
+                                        self._settings.vision_timeout_s,
+                                        self._settings.max_reply_tokens)
+
+    async def vision_reply(self, system_prompt: str, question: str,
+                           image_b64: str, mime: str = "image/jpeg") -> str:
+        last: ProviderError | None = None
+        for model in self._candidates():
+            self.model = model
+            try:
+                answer = await self._build(model).vision_reply(
+                    system_prompt, question, image_b64, mime)
+                self._locked = model  # Yeh model chala - aage isi ko use karenge.
+                return answer
+            except ProviderError as exc:
+                last = exc
+                if exc.kind != ProviderError.MODEL_NOT_FOUND:
+                    raise
+        raise last or ProviderError(ProviderError.NOT_CONFIGURED, "no vision model worked")
+
+
+def build_vision_provider(settings) -> VisionRouter:
+    """Vision ke liye alag router. Provider ready na ho to ProviderError."""
+    if settings.provider == "gemini":
+        if not settings.gemini_api_key:
+            raise ProviderError(ProviderError.NOT_CONFIGURED, "GEMINI_API_KEY is missing")
+        return VisionRouter(settings)
+    if settings.provider == "openai_compatible":
+        if not settings.openai_api_key:
+            raise ProviderError(ProviderError.NOT_CONFIGURED, "OPENAI_API_KEY is missing")
+        return VisionRouter(settings)
+    raise ProviderError(ProviderError.NOT_CONFIGURED, "vision needs gemini or openai_compatible")
 
 
 def build_provider(settings) -> Provider:
@@ -689,6 +859,7 @@ Run with ONE worker because conversation context is in memory.
 """
 
 import asyncio
+import base64
 import hmac
 import logging
 import re
@@ -707,6 +878,7 @@ app = FastAPI(title="NEXORA AI backend", version="0.1", docs_url=None, redoc_url
 sessions = SessionStore(settings.session_ttl_s, settings.max_sessions, settings.max_history_messages)
 limiter = RateLimiter(settings.rate_per_minute, settings.rate_per_day)
 _provider = None
+_vision = None
 
 
 def provider():
@@ -752,9 +924,69 @@ LIVE_PROMPT_SUFFIX = (
 )
 
 
+def vision_provider():
+    global _vision
+    if _vision is None:
+        _vision = build_vision_provider(settings)  # raises ProviderError when not configured
+    return _vision
+
+
+# Camera ke liye: tasveer dekh kar chhota, bolne layak jawaab. Guess nahi - sirf jo dikhe.
+VISION_PROMPT = (
+    "\n\nThe user pointed your camera at something and asked: \"{question}\"\n"
+    "Look at the picture and answer: name the main thing you see, its colour, and one useful "
+    "detail, in your normal short spoken style. If the picture is dark, blurry or you are not "
+    "sure, say in one short sentence that you cannot see it clearly - never guess. Never say who "
+    "a person is. Follow the same length, language and no-emoji rules as before."
+)
+
+
+class VisionRequest(BaseModel):
+    text: str = Field(default="Yeh kya hai?", max_length=300)
+    image_b64: str = Field(min_length=200, max_length=2000000)
+    session_id: str | None = Field(default=None, max_length=64)
+    user_name: str | None = Field(default=None, max_length=40)
+
+
+class ImageProblem(Exception):
+    """Tasveer galat ho to seedha, imaandaar error."""
+
+    def __init__(self, detail: str, status: int = 422) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+
+
+def decode_image(image_b64: str) -> tuple[str, str]:
+    """base64 JPEG/PNG check. Sirf bharosemand bytes aage jaate hain."""
+    try:
+        raw = base64.b64decode(image_b64, validate=True)
+    except Exception:
+        raise ImageProblem("bad_image") from None
+    if len(raw) < 1000:
+        raise ImageProblem("bad_image")
+    if len(raw) > settings.max_image_bytes:
+        raise ImageProblem("image_too_large", 413)
+    if raw.startswith(b"\xff\xd8\xff"):
+        return image_b64, "image/jpeg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return image_b64, "image/png"
+    raise ImageProblem("bad_image")
+
+
+def profile_note(user_name: str | None) -> str:
+    """Phone ne naam bataya ho (aur yaad rakha ho) to robot usse pyaar se bula sakta hai."""
+    name = (user_name or "").strip()[:40]
+    if not name:
+        return ""
+    return ("\n\nThe user's name is " + name +
+            ". Use their name warmly once in a while, never in every sentence.")
+
+
 class ChatRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     session_id: str | None = Field(default=None, max_length=64)
+    user_name: str | None = Field(default=None, max_length=40)
 
 
 def require_device(x_device_token: str | None = Header(default=None)) -> str:
@@ -782,6 +1014,8 @@ async def health() -> dict:
         "model": settings.provider_model,
         "brain_ready": ready,
         "tokens_configured": bool(settings.device_tokens),
+        "vision": settings.vision_enabled,
+        "vision_models": list(settings.vision_models)[:3],
         "sessions": sessions.session_count(),
         "time": int(time.time()),
     }
@@ -820,7 +1054,8 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
         if live:
             logger.info("live info added (%d chars)", len(live))
 
-    prompt = settings.system_prompt + (LIVE_PROMPT_SUFFIX.format(info=live) if live else "")
+    prompt = (settings.system_prompt + profile_note(request.user_name)
+              + (LIVE_PROMPT_SUFFIX.format(info=live) if live else ""))
     try:
         answer = await with_timeout(
             active.reply(prompt, messages), settings.request_timeout_s)
@@ -856,6 +1091,67 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
         "session_id": session_id,
         "model": active.model,
         "live": bool(live),  # app isko dikhata nahi; debugging ke liye hai
+    }
+
+
+@app.post("/v1/vision")
+async def vision(request: VisionRequest, token: str = Depends(require_device)) -> dict:
+    """On-demand camera: ek tasveer + ek sawaal -> chhota jawaab. Tasveer kahin save nahi hoti."""
+    if not settings.vision_enabled:
+        raise HTTPException(status_code=503, detail="vision_disabled")
+
+    allowed, retry_after = limiter.check(token)
+    if not allowed:
+        return JSONResponse(status_code=429,
+                            content={"detail": "rate_limited", "retry_after_s": retry_after})
+    try:
+        image_b64, mime = decode_image(request.image_b64)
+    except ImageProblem as problem:
+        raise HTTPException(status_code=problem.status, detail=problem.detail) from None
+
+    try:
+        active = vision_provider()
+    except ProviderError:
+        raise HTTPException(status_code=503, detail="vision_not_configured") from None
+
+    question = request.text.strip() or "Yeh kya hai?"
+    prompt = (settings.system_prompt + VISION_PROMPT.format(question=question)
+              + profile_note(request.user_name))
+    session_id, _ = sessions.history(request.session_id)
+    try:
+        answer = await with_timeout(
+            active.vision_reply(prompt, question, image_b64, mime), settings.vision_timeout_s)
+    except ProviderError as exc:
+        logger.warning("vision failure: %s", exc.kind)
+        status = {
+            ProviderError.AUTH: 502,
+            ProviderError.RATE_LIMIT: 429,
+            ProviderError.TIMEOUT: 504,
+            ProviderError.NETWORK: 504,
+            ProviderError.SERVER: 502,
+            ProviderError.BAD_RESPONSE: 502,
+            ProviderError.MODEL_NOT_FOUND: 503,
+            ProviderError.NOT_CONFIGURED: 503,
+        }.get(exc.kind, 502)
+        detail = "rate_limited" if exc.kind == ProviderError.RATE_LIMIT else f"vision_{exc.kind}"
+        raise HTTPException(status_code=status, detail=detail) from None
+    except Exception:  # noqa: BLE001 - never leak internals to the phone
+        logger.exception("unexpected vision error")
+        raise HTTPException(status_code=502, detail="vision_error") from None
+
+    answer = clean_reply(answer.strip())
+    if not answer:
+        raise HTTPException(status_code=502, detail="provider_empty")
+
+    sessions.append(session_id, "user", f"[photo] {question}")
+    sessions.append(session_id, "assistant", answer)
+    logger.info("vision ok session=%s chars=%d", session_id[:8], len(answer))
+    return {
+        "reply": answer,
+        "language": guess_language(answer),
+        "session_id": session_id,
+        "model": active.model,
+        "vision": True,
     }
 
 
@@ -903,10 +1199,11 @@ async def home() -> HTMLResponse:
     dot = "#16a34a" if ready else "#dc2626"
     state = "AI BRAIN READY - bol ke dekho!" if ready else "AI key nahi mili - Render -> Environment me key daalo"
     live = "ON" if settings.web_search else "OFF"
+    eyes = "ON" if settings.vision_enabled else "OFF"
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>NEXORA server</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;text-align:center;padding:40px">
 <h1 style="margin:0 0 6px">NEXORA server chal raha hai</h1>
-<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live}</p>
+<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live} &nbsp;|&nbsp; camera vision: {eyes}</p>
 <p style="font-size:20px"><span style="color:{dot};font-size:28px">&#9679;</span> {state}</p>
 <p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> par poora status JSON milta hai</p>
 </body></html>"""
