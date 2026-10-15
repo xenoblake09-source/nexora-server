@@ -1,21 +1,25 @@
 """NEXORA AI backend - single-file deploy bundle (Render free tier ke liye).
 
 Yeh file nexora-phase3/backend/app/ ke saare modules ek me jodti hai:
-config + providers + sessions + websearch + api.
+config + providers + sessions + websearch + tts + api.
 
-Is version me (15 Oct subah ka update):
+Is version me (15 Oct, awaaz wala update):
+  * ASLI MALE AWAAZ (naya): /v1/speech text ko MP3 me badalta hai - Microsoft ki free
+    neural voices se (Hi: Madhur, En: Prabhat, Ta: Valluvar, Te: Mohan, Bn: Bashkar,
+    Mr: Manohar, Gu: Niranjan, Kn: Gagan, Ml: Midhun, Ur: Salman). Koi API key nahi.
+    Mood "gehri bhaari aur cute": TTS_RATE=+18%, TTS_PITCH=-10Hz (env se badal sakte ho).
+    Punjabi/Odia ka male neural voice nahi hai -> wahan app phone ki apni voice chalata hai.
   * SAHI JAWAAB: "kaun CM/PM/President hai" jaisa sawaal Hindi, Hinglish ya English me ho -
-    server ab sawaal ko English keywords me badal kar ("bihar chief minister") taaza khabar
-    laata hai, jisme aaj ke mukhyamantri ka naam hota hai. Prompt model ko kehta hai ki live
-    jaankari ka naam seedha bolo, "pata nahi" nahi.
-  * MULTILANGUAGE: Hindi, Hinglish, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada,
-    Malayalam, Punjabi, Odia, Urdu + English - jawaab usi bhasha aur ussi script me.
+    server sawaal ko English keywords me badal kar ("bihar chief minister") taaza khabar
+    laata hai, jisme aaj ke mukhyamantri ka naam hota hai.
+  * MULTILANGUAGE: 13 bhashayein - jawaab usi bhasha aur ussi script me.
   * /v1/vision - on-demand camera (tasveer save nahi hoti).
   * user_name (optional): robot naam se bula sakta hai; server naam store nahi karta.
-  * LIVE INFO: mausam (open-meteo), khabar (Google News RSS), facts (Wikipedia) - bina key.
 
 Start command (Render):  uvicorn app:app --host 0.0.0.0 --port $PORT
 """
+
+import types  # bundle: tts namespace banane ke liye
 
 # ===================== merged from app/config.py =====================
 """NEXORA backend configuration. Secrets only ever come from the environment (.env)."""
@@ -118,6 +122,11 @@ class Settings:
     city: str
     search_timeout_s: float
     vision_enabled: bool
+    tts_enabled: bool
+    tts_rate: str
+    tts_pitch: str
+    speech_max_chars: int
+    speech_timeout_s: float
     vision_models: tuple
     max_image_bytes: int
     vision_timeout_s: float
@@ -182,6 +191,14 @@ def get_settings() -> Settings:
         city=os.getenv("CITY", "Patna").strip() or "Patna",
         search_timeout_s=_as_float("SEARCH_TIMEOUT_S", 8.0, 3.0),
         vision_enabled=os.getenv("VISION_ENABLED", "1").strip() != "0",
+        # ---- Awaaz (neural male voice, MP3) ----
+        # TTS_ENABLED=0 se server ki awaaz band, phone ki apni voice chalegi.
+        # TTS_RATE / TTS_PITCH se awaaz ka mood: "+18%" + "-10Hz" = gehri bhaari aur cute.
+        tts_enabled=os.getenv("TTS_ENABLED", "1").strip() != "0",
+        tts_rate=os.getenv("TTS_RATE", "+18%").strip() or "+18%",
+        tts_pitch=os.getenv("TTS_PITCH", "-10Hz").strip() or "-10Hz",
+        speech_max_chars=int(os.getenv("SPEECH_MAX_CHARS", "600")),
+        speech_timeout_s=float(os.getenv("SPEECH_TIMEOUT_S", "15")),
         vision_models=vision_models,
         max_image_bytes=_as_int("MAX_IMAGE_BYTES", 350000, 20000),
         vision_timeout_s=_as_float("VISION_TIMEOUT_S", 40.0, 10.0),
@@ -990,6 +1007,84 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
     lines = [ln for ln in lines if ln.strip()][:budget]
     return "\n".join(f"- {ln}" for ln in lines) if lines else None
 
+# ===================== merged from app/tts.py =====================
+"""NEXORA ki asli (neural) awaaz - male aur smooth, ChatGPT/Gemini jaisa.
+
+Microsoft Edge ki free neural voices (edge-tts) se MP3 ban jaati hai. Koi API key
+nahi chahiye. Internet na ho to phone ki apni voice (fallback) chalti hai.
+
+Awaaz ka mood (user ne chuna): "gehri bhaari aur cute" -> rate +18%, pitch -10Hz.
+Ye dono env se badle ja sakte hain: TTS_RATE, TTS_PITCH.
+"""
+
+
+import asyncio
+import logging
+
+logger = logging.getLogger("nexora.tts")
+
+# Har bhasha ka MALE voice. (Microsoft ke paas pa-IN / or-IN ka neural voice nahi hai,
+# un bhashaon me server "no_voice" bhejta hai aur phone ki voice chalti hai.)
+VOICE_BY_LANGUAGE: dict[str, str] = {
+    "hi": "hi-IN-MadhurNeural",          # Hindi male - "gehri bhaari aur cute"
+    "hinglish": "hi-IN-MadhurNeural",    # Hinglish jawaab Devanagari me likha jaata hai
+    "en": "en-IN-PrabhatNeural",         # Indian English male
+    "bn": "bn-IN-BashkarNeural",
+    "ta": "ta-IN-ValluvarNeural",
+    "te": "te-IN-MohanNeural",
+    "mr": "mr-IN-ManoharNeural",
+    "gu": "gu-IN-NiranjanNeural",
+    "kn": "kn-IN-GaganNeural",
+    "ml": "ml-IN-MidhunNeural",
+    "ur": "ur-IN-SalmanNeural",
+}
+
+
+def voice_for(language: str | None) -> str | None:
+    """Bhasha ka code ya tag ("hi", "hi-IN", "ta-IN") -> male voice ka naam."""
+    value = (language or "").strip().lower()
+    if not value:
+        return None
+    if value.startswith("hing"):
+        return VOICE_BY_LANGUAGE["hinglish"]
+    code = value[:2]
+    return VOICE_BY_LANGUAGE.get(code)
+
+
+async def synthesize(text: str, language: str | None, *, rate: str, pitch: str,
+                     timeout: float = 15.0, volume: str = "+0%") -> tuple[bytes, str] | None:
+    """Text -> MP3 bytes + voice ka naam. Kuch bhi galat ho to None (app fallback use karega)."""
+    voice = voice_for(language)
+    if not voice or not text.strip():
+        return None
+    try:
+        import edge_tts  # Import yahan: server chalu ho jaaye chahe package na mile.
+    except Exception:  # noqa: BLE001
+        logger.warning("edge-tts install nahi hai - phone ki voice use hogi")
+        return None
+    try:
+        communicate = edge_tts.Communicate(text.strip(), voice, rate=rate, pitch=pitch,
+                                           volume=volume)
+        chunks: list[bytes] = []
+        async with asyncio.timeout(timeout):
+            async for piece in communicate.stream():
+                if piece.get("type") == "audio" and piece.get("data"):
+                    chunks.append(piece["data"])
+        audio = b"".join(chunks)
+        if not audio:
+            logger.warning("TTS se khaali audio aaya")
+            return None
+        return audio, voice
+    except Exception as exception:  # noqa: BLE001
+        logger.warning("TTS fail: %s", exception.__class__.__name__)
+        return None
+
+
+# Bundle me tts ek alag file nahi hai - main.py ke "tts.xxx" calls ke liye chhota namespace.
+tts = types.SimpleNamespace(voice_for=voice_for, synthesize=synthesize,
+                            VOICE_BY_LANGUAGE=VOICE_BY_LANGUAGE)
+
+
 # ===================== merged from app/main.py =====================
 """NEXORA backend API.
 
@@ -999,6 +1094,7 @@ Run with ONE worker because conversation context is in memory.
 
 import asyncio
 import base64
+import types
 import hmac
 import logging
 import re
@@ -1159,6 +1255,8 @@ async def health() -> dict:
         "brain_ready": ready,
         "tokens_configured": bool(settings.device_tokens),
         "vision": settings.vision_enabled,
+        "speech": settings.tts_enabled,
+        "speech_voices": sorted(tts.VOICE_BY_LANGUAGE),
         "vision_models": list(settings.vision_models)[:3],
         "sessions": sessions.session_count(),
         "time": int(time.time()),
@@ -1237,6 +1335,38 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
         "live": bool(live),  # app isko dikhata nahi; debugging ke liye hai
     }
 
+
+class SpeechRequest(BaseModel):
+    """Awaaz banane ka request: text + uski bhasha (hi, hinglish, en, ta, bn ...)."""
+
+    text: str = Field(min_length=1, max_length=600)
+    language: str = Field(default="en", max_length=16)
+
+
+@app.post("/v1/speech")
+async def speech(request: SpeechRequest, token: str = Depends(require_device)) -> JSONResponse:
+    """Text -> MP3 (male neural voice). Rate limiter yahan nahi lagta: ye /v1/chat ke
+    jawaab ka aawaaz hai, aur ek jawaab ke 2-3 tukde ban sakte hain."""
+    if not settings.tts_enabled:
+        return JSONResponse({"ok": False, "reason": "speech_off"})
+    if len(request.text) > settings.speech_max_chars:
+        return JSONResponse({"ok": False, "reason": "too_long"})
+    # Pehle check: is bhasha ka male voice hai bhi? Nahi to app turant phone ki voice use kare.
+    if tts.voice_for(request.language) is None:
+        return JSONResponse({"ok": False, "reason": "no_voice"})
+    result = await tts.synthesize(request.text, request.language,
+                                 rate=settings.tts_rate, pitch=settings.tts_pitch,
+                                 timeout=settings.speech_timeout_s)
+    if result is None:
+        return JSONResponse({"ok": False, "reason": "failed"})
+    audio, voice = result
+    return JSONResponse({
+        "ok": True,
+        "voice": voice,
+        "mime": "audio/mpeg",
+        "bytes": len(audio),
+        "audio_b64": base64.b64encode(audio).decode("ascii"),
+    })
 
 @app.post("/v1/vision")
 async def vision(request: VisionRequest, token: str = Depends(require_device)) -> dict:
@@ -1321,33 +1451,14 @@ async def home() -> HTMLResponse:
     except ProviderError:
         ready = False
     dot = "#16a34a" if ready else "#dc2626"
-    state = "AI BRAIN READY - bol ke dekho!" if ready else "AI key nahi mili - Render -> Environment me GEMINI_API_KEY daalo"
-    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>NEXORA server</title></head>
-<body style="font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;text-align:center;padding:40px">
-<h1 style="margin:0 0 6px">NEXORA server chal raha hai</h1>
-<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model}</p>
-<p style="font-size:20px"><span style="color:{dot};font-size:28px">&#9679;</span> {state}</p>
-<p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> par poora status JSON milta hai</p>
-</body></html>"""
-    return HTMLResponse(html)
-
-# ---------------------------------------------------------------- friendly home page
-@app.get("/", include_in_schema=False)
-async def home() -> HTMLResponse:
-    """Chhota sa page: browser me khol ke turant pata chal jaata hai ki server chalu hai."""
-    ready = settings.provider_ready
-    try:
-        provider()
-    except ProviderError:
-        ready = False
-    dot = "#16a34a" if ready else "#dc2626"
     state = "AI BRAIN READY - bol ke dekho!" if ready else "AI key nahi mili - Render -> Environment me key daalo"
     live = "ON" if settings.web_search else "OFF"
     eyes = "ON" if settings.vision_enabled else "OFF"
+    voice = "ON (male neural)" if settings.tts_enabled else "OFF"
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>NEXORA server</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;text-align:center;padding:40px">
 <h1 style="margin:0 0 6px">NEXORA server chal raha hai</h1>
-<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live} &nbsp;|&nbsp; camera vision: {eyes} &nbsp;|&nbsp; languages: 13</p>
+<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live} &nbsp;|&nbsp; camera vision: {eyes} &nbsp;|&nbsp; voice: {voice} &nbsp;|&nbsp; languages: 13</p>
 <p style="font-size:20px"><span style="color:{dot};font-size:28px">&#9679;</span> {state}</p>
 <p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> par poora status JSON milta hai</p>
 </body></html>"""
