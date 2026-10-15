@@ -3,15 +3,14 @@
 Yeh file nexora-phase3/backend/app/ ke saare modules ek me jodti hai:
 config + providers + sessions + websearch + api.
 
-Is version me (14 Oct, shaam ka update):
-  * SAHI JAWAAB (aaj ka sach): "kaun CM/PM/President hai" jaisa sawaal ab hamesha live
-    jaankari (khabar + Wikipedia) le kar aata hai, aur prompt model ko kehta hai ki
-    live jaankari ko apni yaad se zyada bharosa karo. (Bihar CM jaise sawaal pehle
-    purane gyaan se galat jawaab de rahe the.)
+Is version me (15 Oct subah ka update):
+  * SAHI JAWAAB: "kaun CM/PM/President hai" jaisa sawaal Hindi, Hinglish ya English me ho -
+    server ab sawaal ko English keywords me badal kar ("bihar chief minister") taaza khabar
+    laata hai, jisme aaj ke mukhyamantri ka naam hota hai. Prompt model ko kehta hai ki live
+    jaankari ka naam seedha bolo, "pata nahi" nahi.
   * MULTILANGUAGE: Hindi, Hinglish, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada,
     Malayalam, Punjabi, Odia, Urdu + English - jawaab usi bhasha aur ussi script me.
-  * /v1/vision - on-demand camera (tasveer save nahi hoti). VISION_MODELS me se pehla
-    chalne wala model apne aap chun liya jaata hai.
+  * /v1/vision - on-demand camera (tasveer save nahi hoti).
   * user_name (optional): robot naam se bula sakta hai; server naam store nahi karta.
   * LIVE INFO: mausam (open-meteo), khabar (Google News RSS), facts (Wikipedia) - bina key.
 
@@ -783,9 +782,80 @@ _NEWS_STOPWORDS = {
 }
 
 
+# Pad/office ke shabd Hindi/Hinglish/Devanagari se English me - kyunki Google News aur
+# English Wikipedia English keywords par sahi (aur taaza) natija dete hain.
+_OFFICE_EN = {
+    # English (sabse pehle, kyunki ye seedha match hone chahiye)
+    "chief minister": "chief minister", "prime minister": "prime minister",
+    "deputy chief minister": "deputy chief minister", "president": "president",
+    "governor": "governor", "mayor": "mayor", "home minister": "home minister",
+    # Hindi / Devanagari
+    "मुख्यमंत्री": "chief minister", "मुख्य मंत्री": "chief minister", "सीएम": "chief minister",
+    "mukhyamantri": "chief minister", "mukhya mantri": "chief minister", "cm": "chief minister",
+    "प्रधानमंत्री": "prime minister", "प्रधान मंत्री": "prime minister", "पीएम": "prime minister",
+    "pradhanmantri": "prime minister", "pradhan mantri": "prime minister", "pm": "prime minister",
+    "राष्ट्रपति": "president", "rashtrapati": "president",
+    "राज्यपाल": "governor", "rajyapal": "governor",
+    "महापौर": "mayor", "mayor": "mayor",
+    "उपमुख्यमंत्री": "deputy chief minister", "उप मुख्यमंत्री": "deputy chief minister",
+    "upmukhyamantri": "deputy chief minister",
+}
+# Rajya/desh ke naam Devanagari se English (news + Wikipedia dono ke liye zaroori).
+_PLACE_EN = {
+    "बिहार": "bihar", "उत्तर प्रदेश": "uttar pradesh", "मध्य प्रदेश": "madhya pradesh",
+    "महाराष्ट्र": "maharashtra", "राजस्थान": "rajasthan", "गुजरात": "gujarat",
+    "पंजाब": "punjab", "हरियाणा": "haryana", "झारखंड": "jharkhand", "छत्तीसगढ़": "chhattisgarh",
+    "छत्तीसगढ": "chhattisgarh", "उत्तराखंड": "uttarakhand", "हिमाचल प्रदेश": "himachal pradesh",
+    "पश्चिम बंगाल": "west bengal", "बंगाल": "west bengal", "ओडिशा": "odisha", "उड़ीसा": "odisha",
+    "तेलंगाना": "telangana", "आंध्र प्रदेश": "andhra pradesh", "कर्नाटक": "karnataka",
+    "केरल": "kerala", "तमिलनाडु": "tamil nadu", "असम": "assam", "गोवा": "goa",
+    "त्रिपुरा": "tripura", "मणिपुर": "manipur", "मेघालय": "meghalaya", "मिजोरम": "mizoram",
+    "नागालैंड": "nagaland", "अरुणाचल प्रदेश": "arunachal pradesh", "सिक्किम": "sikkim",
+    "दिल्ली": "delhi", "पटना": "patna", "मुंबई": "mumbai", "कोलकाता": "kolkata",
+    "चेन्नई": "chennai", "भारत": "india",
+}
+# Hinglish/Hindi ke aam rajya-naam (Roman me) - news query ke liye.
+_PLACE_ROMAN = {
+    "bihar": "bihar", "up": "uttar pradesh", "uttar": "uttar pradesh", "mp": "madhya pradesh",
+    "maharashtra": "maharashtra", "rajasthan": "rajasthan", "gujarat": "gujarat", "punjab": "punjab",
+    "haryana": "haryana", "jharkhand": "jharkhand", "bengal": "west bengal", "odisha": "odisha",
+    "karnataka": "karnataka", "kerala": "kerala", "telangana": "telangana", "assam": "assam",
+    "delhi": "delhi", "patna": "patna", "india": "india",
+}
+
+
 def office_query(text: str) -> str:
-    """Wikipedia ke liye saaf sawaal: "who is the chief minister of bihar" -> "chief minister of bihar"."""
-    cleaned = re.sub(r"[^\w\s\u0900-\u097f]", " ", text.lower())
+    """Sawaal ko saaf ENGLISH keywords me badlo (news/Wikipedia isi me sahi jawaab dete hain).
+
+    "बिहार के मुख्यमंत्री कौन है"      -> "bihar chief minister"
+    "who is the chief minister of bihar" -> "bihar chief minister"
+    "bihar ke cm kaun hai"               -> "bihar chief minister"
+    """
+    low = text.lower()
+    office = ""
+    place = ""
+    for hindi, english in _OFFICE_EN.items():
+        # Chhote shabd (cm/pm/up) poore shabd ki tarah match karo, kisi shabd ke andar nahi.
+        if len(hindi) <= 3 and re.fullmatch(r"[a-z]+", hindi):
+            if re.search(rf"\b{hindi}\b", low):
+                office = english
+                break
+        elif hindi in low:
+            office = english
+            break
+    for hindi, english in _PLACE_EN.items():
+        if hindi in low:
+            place = english
+            break
+    if not place:
+        for roman, english in _PLACE_ROMAN.items():
+            if re.search(rf"\b{roman}\b", low):
+                place = english
+                break
+    if office or place:
+        return f"{place} {office}".strip() or "chief minister"
+    # Purana behaviour (kuch aur office-type sawaal): filler hata kar shabd rakh lo.
+    cleaned = re.sub(r"[^\w\s\u0900-\u097f]", " ", low)
     tokens = [t for t in cleaned.split() if len(t) > 1 and t not in _OFFICE_FILLER]
     return " ".join(tokens[:8]).strip() or "chief minister"
 
@@ -796,12 +866,12 @@ _OFFICE_FILLER = {"hey", "nexora", "who", "whose", "is", "the", "of", "kaun", "h
                   "के", "को", "में", "बताओ"}
 
 
-def news_query(text: str) -> str:
+def news_query(text: str, freshness: str = "2d") -> str:
     """Google News ke liye chhota query; when:2d se sirf taaza (2 din ke andar) khabrein."""
     cleaned = re.sub(r"[^\w\s\u0900-\u097f]", " ", text.lower())
     tokens = [t for t in cleaned.split() if len(t) > 1 and t not in _NEWS_STOPWORDS]
     topic = " ".join(tokens[:8]).strip()
-    return (topic or "India") + " when:2d"
+    return (topic or "India") + f" when:{freshness}"
 
 
 async def weather_line(city: str, timeout: float) -> str | None:
@@ -842,10 +912,11 @@ async def weather_line(city: str, timeout: float) -> str | None:
     return None
 
 
-async def news_lines(query: str, timeout: float, limit: int = 4) -> list[str]:
+async def news_lines(query: str, timeout: float, limit: int = 4,
+                      freshness: str = "2d") -> list[str]:
     """Google News RSS - aaj ki khabrein. Koi key nahi chahiye."""
     try:
-        url = ("https://news.google.com/rss/search?q=" + quote(news_query(query))
+        url = ("https://news.google.com/rss/search?q=" + quote(news_query(query, freshness))
                + "&hl=en-IN&gl=IN&ceid=IN:en")
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                      headers={"User-Agent": "Mozilla/5.0"}) as client:
@@ -895,8 +966,14 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
         jobs.append(news_lines(text, timeout))
     # Kaun CM/PM hai jaisa sawaal: Wikipedia + khabar dono (khabar me aaj ka naam hota hai).
     if wants_office(text):
-        jobs.append(wiki_lines(office_query(text), timeout, limit=2))
-        jobs.append(news_lines(text, timeout, limit=3))
+        # English keywords me dhoondo: "bihar chief minister" jaisi query par aaj ki khabar
+        # me seedha naam milta hai (jaise "Bihar CM Samrat Choudhary ...").
+        clean = office_query(text)
+        # Sabse pehle 2 din ki taaza khabar: isi me aaj ka naam hota hai ("Bihar CM Samrat...").
+        jobs.append(news_lines(clean, timeout, limit=3))
+        jobs.append(wiki_lines(clean, timeout, limit=2))
+        # Backup: 1 hafte ki khabrein (agar 2 din me kuch na ho).
+        jobs.append(news_lines(clean, timeout, limit=2, freshness="7d"))
     if not jobs:  # koi khaas trigger nahi: Wikipedia facts
         jobs.append(wiki_lines(text, timeout))
     results = await asyncio.gather(*jobs, return_exceptions=True)
@@ -907,8 +984,10 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
             lines.append(result)
         elif isinstance(result, list):
             lines.extend(result)
-    # Bahut chhota context rakhte hain: prompt sasta aur jawaab tez rehta hai.
-    lines = [ln for ln in lines if ln.strip()][:5]
+    # Context chhota rakhte hain (prompt sasta, jawaab tez). Office sawaal me thoda bada,
+    # kyunki wahan khabar ke headlines hi naam batate hain.
+    budget = 8 if wants_office(text) else 5
+    lines = [ln for ln in lines if ln.strip()][:budget]
     return "\n".join(f"- {ln}" for ln in lines) if lines else None
 
 # ===================== merged from app/main.py =====================
@@ -980,8 +1059,12 @@ LIVE_PROMPT_SUFFIX = (
     "\n\nLIVE INFORMATION just fetched from the internet:\n{info}\n"
     "Use this live information to answer the question, and TRUST IT over your own memory: if it "
     "names a different person, number or date than you remember, the live information is the "
-    "correct one. Quote the names and numbers from it. If the answer is not in the live "
-    "information, say honestly in ONE short sentence that you could not find it right now."
+    "correct one. Quote the names and numbers from it. If a headline or reference contains a "
+    "person's name for the post asked about (for example 'CM Samrat Choudhary' or 'Chief Minister "
+    "of Bihar ... Samrat Choudhary'), then say that name straight away as the first thing in your "
+    "answer - never reply that you do not know while a name is visible here. Only if no name "
+    "appears anywhere in the live information, say honestly in ONE short sentence that you could "
+    "not find it right now."
 )
 
 
