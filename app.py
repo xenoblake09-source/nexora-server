@@ -189,7 +189,7 @@ def get_settings() -> Settings:
         max_reply_tokens=_as_int("MAX_REPLY_TOKENS", 220, 40),
         web_search=os.getenv("WEB_SEARCH", "1").strip() != "0",
         city=os.getenv("CITY", "Patna").strip() or "Patna",
-        search_timeout_s=_as_float("SEARCH_TIMEOUT_S", 8.0, 3.0),
+        search_timeout_s=_as_float("SEARCH_TIMEOUT_S", 6.0, 3.0),
         vision_enabled=os.getenv("VISION_ENABLED", "1").strip() != "0",
         # ---- Awaaz (neural male voice, MP3) ----
         # TTS_ENABLED=0 se server ki awaaz band, phone ki apni voice chalegi.
@@ -660,6 +660,7 @@ Sources (sab free, koi key nahi):
 import asyncio
 import html
 import re
+import time
 from urllib.parse import quote
 
 import httpx
@@ -841,16 +842,10 @@ _PLACE_ROMAN = {
 }
 
 
-def office_query(text: str) -> str:
-    """Sawaal ko saaf ENGLISH keywords me badlo (news/Wikipedia isi me sahi jawaab dete hain).
-
-    "बिहार के मुख्यमंत्री कौन है"      -> "bihar chief minister"
-    "who is the chief minister of bihar" -> "bihar chief minister"
-    "bihar ke cm kaun hai"               -> "bihar chief minister"
-    """
+def office_parts(text: str) -> tuple[str, str] | None:
+    """Sawaal se (office, jagah) English me nikalo: ("chief minister", "bihar"). Na mile to None."""
     low = text.lower()
     office = ""
-    place = ""
     for hindi, english in _OFFICE_EN.items():
         # Chhote shabd (cm/pm/up) poore shabd ki tarah match karo, kisi shabd ke andar nahi.
         if len(hindi) <= 3 and re.fullmatch(r"[a-z]+", hindi):
@@ -860,6 +855,7 @@ def office_query(text: str) -> str:
         elif hindi in low:
             office = english
             break
+    place = ""
     for hindi, english in _PLACE_EN.items():
         if hindi in low:
             place = english
@@ -869,8 +865,22 @@ def office_query(text: str) -> str:
             if re.search(rf"\b{roman}\b", low):
                 place = english
                 break
-    if office or place:
-        return f"{place} {office}".strip() or "chief minister"
+    if office and place:
+        return office, place
+    return None
+
+
+def office_query(text: str) -> str:
+    """Sawaal ko saaf ENGLISH keywords me badlo (news/Wikipedia isi me sahi jawaab dete hain).
+
+    "बिहार के मुख्यमंत्री कौन है"      -> "bihar chief minister"
+    "who is the chief minister of bihar" -> "bihar chief minister"
+    "bihar ke cm kaun hai"               -> "bihar chief minister"
+    """
+    parts = office_parts(text)
+    if parts:
+        return f"{parts[1]} {parts[0]}".strip()
+    low = text.lower()
     # Purana behaviour (kuch aur office-type sawaal): filler hata kar shabd rakh lo.
     cleaned = re.sub(r"[^\w\s\u0900-\u097f]", " ", low)
     tokens = [t for t in cleaned.split() if len(t) > 1 and t not in _OFFICE_FILLER]
@@ -974,6 +984,160 @@ async def wiki_lines(query: str, timeout: float, limit: int = 2) -> list[str]:
         return []
 
 
+# Wikipedia ke infobox se "abhi ka aadmi" - sabse seedha aur pakka tarika.
+_WIKI_EN_API = "https://en.wikipedia.org/w/api.php"
+_INCUMBENT_CACHE: dict = {}          # {key: (time, line)} - baar-baar wahi sawaal par API ko na pareshan karein
+_INCUMBENT_CACHE_TTL = 900.0         # 15 minute tak yaad rakho
+
+
+def _page_wikitext(payload: dict) -> str:
+    """Wikipedia API ke jawaab me se page ka asli (wikitext) content nikalo."""
+    pages = ((payload or {}).get("query", {}) or {}).get("pages", {}) or {}
+    for page in pages.values():
+        try:
+            return page["revisions"][0]["slots"]["main"]["*"]
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def _incumbent_name(wikitext: str) -> str | None:
+    """Infobox ki "incumbent = ..." line se sirf naam nikalo ([[Samrat Choudhary|Samrat]] -> Samrat)."""
+    match = re.search(r"\|\s*incumbent\s*=\s*([^\n]+)", wikitext)
+    if not match:
+        return None
+    raw = match.group(1)
+    link = re.search(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", raw)
+    if link:
+        name = link.group(2) or link.group(1)
+    else:
+        name = re.sub(r"<ref.*?</ref>|<ref[^>]*/>", "", raw)
+        name = re.sub(r"\{\{[^}]*\}\}", "", name)
+        name = re.sub(r"[\[\]']", "", name)
+    name = name.strip()
+    if not name or len(name) > 60:
+        return None
+    return name
+
+
+async def wiki_incumbent_line(office_en: str, place_en: str, timeout: float = 8.0) -> str | None:
+    """Wikipedia ke page ("Chief Minister of Bihar") ke infobox se ABHI ka naam.
+
+    Ek retry hai (Wikimedia kabhi-kabhi 429 "too many requests" deta hai) aur 15 minute ka
+    cache, taaki server API par bojh na daale.
+    """
+    if not office_en or not place_en:
+        return None
+    key = f"{office_en}|{place_en}"
+    cached = _INCUMBENT_CACHE.get(key)
+    now = time.time()
+    if cached and now - cached[0] < _INCUMBENT_CACHE_TTL:
+        return cached[1]
+    title = f"{office_en.title()} of {place_en.title()}"
+    line = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                         headers={"User-Agent": "NexoraRobot/1.0 (school project)"}) as client:
+                response = await client.get(_WIKI_EN_API, params={
+                    "action": "query", "prop": "revisions", "titles": title,
+                    "rvprop": "content", "rvslots": "main", "format": "json", "redirects": "1",
+                })
+            text = response.text or ""
+            if not text.strip():
+                raise ValueError("khaali jawaab (rate limit?)")
+            name = _incumbent_name(_page_wikitext(response.json()))
+            if name:
+                line = f"Live fact: the current {office_en.title()} of {place_en.title()} is {name}."
+            break
+        except Exception:  # noqa: BLE001
+            if attempt == 1:
+                await asyncio.sleep(1.5)
+    _INCUMBENT_CACHE[key] = (time.time(), line)
+    return line
+
+
+_WD_API = "https://www.wikidata.org/w/api.php"
+_WD_UA = {"User-Agent": "NexoraRobot/1.0 (school project)"}
+
+
+def _wd_incumbent(claims: list) -> tuple | None:
+    """Wikidata claims me se ABHI wala office holder chuno.
+
+    Jis office holder ka koi "end time" (P582) nahi hai, wahi abhi kursi par hai.
+    Aisa koi na mile to sabse naya (latest start time wala) chuno.
+    """
+    latest = None
+    for row in claims:
+        mainsnak = row.get("mainsnak", {}) or {}
+        value = (mainsnak.get("datavalue", {}) or {}).get("value", {}) or {}
+        person = value.get("id") if isinstance(value, dict) else None
+        if not person:
+            continue
+        qualifiers = row.get("qualifiers", {}) or {}
+        start = ""
+        if "P580" in qualifiers:
+            time_value = (qualifiers["P580"][0].get("datavalue", {}) or {}).get("value", {}) or {}
+            start = str(time_value.get("time", ""))[:5].lstrip("+")
+        if "P582" not in qualifiers:  # end time nahi = abhi kursi par
+            return person, start
+        if latest is None or start > latest[1]:
+            latest = (person, start)
+    return latest
+
+
+async def wikidata_office_line(office_en: str, place_en: str, timeout: float = 8.0) -> str | None:
+    """Wikidata (free, bina key) se: "Chief Minister of Bihar" ka ABHI ka aadmi kaun hai.
+
+    Ye source har server se chalta hai aur seedha naam deta hai (khabar par nirbhar nahi) -
+    isliye "Bihar ke mukhyamantri kaun hai" ka jawaab pakka aata hai.
+    """
+    if not office_en or not place_en:
+        return None
+    query = f"{office_en} of {place_en}".strip()
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=_WD_UA, follow_redirects=True) as client:
+            found = await client.get(_WD_API, params={
+                "action": "wbsearchentities", "search": query, "language": "en",
+                "format": "json", "limit": 5,
+            })
+            hits = found.json().get("search", [])
+            wanted = set(office_en.split())
+            entity = None
+            for hit in hits:
+                label = (hit.get("label") or "").lower()
+                if wanted and all(word in label for word in wanted):
+                    entity = hit.get("id")
+                    break
+            if entity is None and hits:
+                entity = hits[0].get("id")
+            if not entity:
+                return None
+
+            claimed = await client.get(_WD_API, params={
+                "action": "wbgetclaims", "entity": entity, "property": "P1308", "format": "json",
+            })
+            rows = (claimed.json().get("claims", {}) or {}).get("P1308", [])
+            chosen = _wd_incumbent(rows)
+            if not chosen:
+                return None
+            person_id, start = chosen
+
+            named = await client.get(_WD_API, params={
+                "action": "wbgetentities", "ids": person_id, "props": "labels",
+                "languages": "en|hi", "format": "json",
+            })
+            labels = (named.json().get("entities", {}).get(person_id, {}) or {}).get("labels", {})
+            label = (labels.get("en", {}) or {}).get("value") or (labels.get("hi", {}) or {}).get("value")
+            if not label:
+                return None
+            since = f", in office since {start}" if start else ""
+            return (f"Live fact (Wikidata): the current {office_en.title()} of "
+                    f"{place_en.title()} is {label}{since}.")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def live_context(text: str, default_city: str, timeout: float = 8.0) -> str | None:
     """Sawaal ke hisaab se taaza jaankari laao. Kuch na mile to None."""
     jobs = []
@@ -986,7 +1150,13 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
         # English keywords me dhoondo: "bihar chief minister" jaisi query par aaj ki khabar
         # me seedha naam milta hai (jaise "Bihar CM Samrat Choudhary ...").
         clean = office_query(text)
-        # Sabse pehle 2 din ki taaza khabar: isi me aaj ka naam hota hai ("Bihar CM Samrat...").
+        # 1) Sabse pakka: Wikipedia infobox + Wikidata - dono se abhi ka office holder
+        #    (khabar par nirbhar nahi; dono free aur bina key ke hain).
+        parts = office_parts(text)
+        if parts:
+            jobs.append(wiki_incumbent_line(parts[0], parts[1], timeout))
+            jobs.append(wikidata_office_line(parts[0], parts[1], timeout))
+        # 2) 2 din ki taaza khabar: isi me aaj ka naam hota hai ("Bihar CM Samrat...").
         jobs.append(news_lines(clean, timeout, limit=3))
         jobs.append(wiki_lines(clean, timeout, limit=2))
         # Backup: 1 hafte ki khabrein (agar 2 din me kuch na ho).
@@ -1003,7 +1173,7 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
             lines.extend(result)
     # Context chhota rakhte hain (prompt sasta, jawaab tez). Office sawaal me thoda bada,
     # kyunki wahan khabar ke headlines hi naam batate hain.
-    budget = 8 if wants_office(text) else 5
+    budget = 7 if wants_office(text) else 5
     lines = [ln for ln in lines if ln.strip()][:budget]
     return "\n".join(f"- {ln}" for ln in lines) if lines else None
 
@@ -1155,7 +1325,9 @@ LIVE_PROMPT_SUFFIX = (
     "\n\nLIVE INFORMATION just fetched from the internet:\n{info}\n"
     "Use this live information to answer the question, and TRUST IT over your own memory: if it "
     "names a different person, number or date than you remember, the live information is the "
-    "correct one. Quote the names and numbers from it. If a headline or reference contains a "
+    "correct one. Quote the names and numbers from it. A line starting with 'Live fact "
+    "(Wikidata):' is the MOST reliable of all - say that name straight away, even if other lines "
+    "look old or confusing. If a headline or reference contains a "
     "person's name for the post asked about (for example 'CM Samrat Choudhary' or 'Chief Minister "
     "of Bihar ... Samrat Choudhary'), then say that name straight away as the first thing in your "
     "answer - never reply that you do not know while a name is visible here. Only if no name "
