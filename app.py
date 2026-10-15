@@ -298,7 +298,7 @@ class GeminiProvider:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(
                     url, json=payload, headers={"x-goog-api-key": self._api_key},
-                    params={"key": self._api_key})
+                                     params={"key": self._api_key})
         except httpx.TimeoutException as exc:
             raise ProviderError(ProviderError.TIMEOUT, str(exc)) from exc
         except httpx.HTTPError as exc:
@@ -897,8 +897,7 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
     if wants_office(text):
         jobs.append(wiki_lines(office_query(text), timeout, limit=2))
         jobs.append(news_lines(text, timeout, limit=3))
-    if not jobs:  # koi khaas trigger nahi: Wikipedia facts
-        jobs.append(wiki_lines(text, timeout))
+    if not jobs:  # koi khaas trigger nahi: Wikipedia factsjobs.append(wiki_lines(text, timeout))
     results = await asyncio.gather(*jobs, return_exceptions=True)
 
     lines: list[str] = []
