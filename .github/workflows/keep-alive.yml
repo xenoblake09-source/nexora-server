@@ -1,12 +1,24 @@
-name: keep-server-awake
+# NEXORA server ko jagaaye rakhne wali file (Render free 15 min me so jaata hai).
+# GitHub me ise yahan rakho:  .github/workflows/keep-alive.yml
+# Isse har 10 minute me server ko ek halki "hello" jaati hai, to wo sota nahi -
+# aur tumhara pehla sawaal turant jawaab paata hai (30-50 second ka intezaar khatam).
+name: NEXORA keep alive
+
 on:
   schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch:
-permissions: {}
+    - cron: "*/10 * * * *"   # har 10 minute
+  workflow_dispatch:          # chaaho to haath se bhi chala sako
+
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping NEXORA /health
-        run: curl -fsS --max-time 60 "https://nexora-server-adqx.onrender.com/health" > /dev/null
+      - name: Ping NEXORA server
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 60 https://nexora-server-adqx.onrender.com/health)
+            echo "try $i -> HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 20
+          done
+          echo "Server jawaab nahi de raha (Render dashboard check karo)"; exit 0
