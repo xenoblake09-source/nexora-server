@@ -1,15 +1,19 @@
 """NEXORA AI backend - single-file deploy bundle (Render free tier ke liye).
 
 Yeh file nexora-phase3/backend/app/ ke saare modules ek me jodti hai:
-config + providers + sessions + websearch + api. AI key yahan nahi likhi - woh Render ke
-"Environment Variables" me daali jaati hai (OPENAI_API_KEY / GEMINI_API_KEY).
+config + providers + sessions + websearch + api.
 
-Is version me (14 Oct update):
-  * user_name (optional): phone app naam bhejti hai to robot usse pyaar se bula sakta hai.
-    Server naam ko store NAHI karta - sirf usi request ke prompt me jaata hai.
-  * /v1/vision - on-demand camera: ek tasveer + ek sawaal -> chhota jawaab (tasveer save nahi hoti).
+Is version me (14 Oct, shaam ka update):
+  * SAHI JAWAAB (aaj ka sach): "kaun CM/PM/President hai" jaisa sawaal ab hamesha live
+    jaankari (khabar + Wikipedia) le kar aata hai, aur prompt model ko kehta hai ki
+    live jaankari ko apni yaad se zyada bharosa karo. (Bihar CM jaise sawaal pehle
+    purane gyaan se galat jawaab de rahe the.)
+  * MULTILANGUAGE: Hindi, Hinglish, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada,
+    Malayalam, Punjabi, Odia, Urdu + English - jawaab usi bhasha aur ussi script me.
+  * /v1/vision - on-demand camera (tasveer save nahi hoti). VISION_MODELS me se pehla
+    chalne wala model apne aap chun liya jaata hai.
+  * user_name (optional): robot naam se bula sakta hai; server naam store nahi karta.
   * LIVE INFO: mausam (open-meteo), khabar (Google News RSS), facts (Wikipedia) - bina key.
-  * clean_reply: emoji/markdown/dash hataata hai; language reply ke script se banti hai.
 
 Start command (Render):  uvicorn app:app --host 0.0.0.0 --port $PORT
 """
@@ -34,9 +38,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "1. Answer the user's real question in the FIRST sentence. Never dodge an answer or replace it "
     "with a joke.\n"
     "2. Stay very short: 1 or 2 sentences, at most about 25 words in total.\n"
-    "3. Use ONE script only. If the user speaks English, answer in English. If the user speaks "
-    "Hindi or Hinglish, answer in simple everyday Hindi using DEVANAGARI letters only, with no "
-    "Roman Hindi mixed in.\n"
+    "3. Answer in the SAME language the user spoke, and use that language's own script. You "
+    "understand and speak Indian languages such as Hindi, Hinglish, Bengali, Tamil, Telugu, "
+    "Marathi, Gujarati, Kannada, Malayalam, Punjabi, Odia and Urdu, plus English. If the user "
+    "spoke Hindi or Hinglish, answer in simple everyday Hindi using DEVANAGARI letters only, "
+    "with no Roman Hindi mixed in.\n"
     "4. No extra lines: no greeting at the start, no closing question, no offer of more help, no "
     "repeating the question, no stage directions in brackets.\n"
     "5. A light playful tone is welcome inside those 1-2 sentences, but for maths, definitions and "
@@ -518,13 +524,32 @@ import uuid
 
 DEVANAGARI = re.compile(r"[\u0900-\u097f]")
 ROMAN_HINDI = {"mera", "meri", "mere", "mujhe", "aap", "kya", "kaise", "hai", "hain", "nahi",
-               "namaste", "batao", "bolo", "karo", "karna", "robot", "kitna", "kaun", "kab"}
+               "namaste", "batao", "bolo", "karo", "karna", "robot", "kitna", "kaun", "kab",
+               # Hinglish ke aam shabd (jaise "main theek hoon", "bahut achha")
+               "hoon", "hun", "theek", "thik", "achha", "accha", "yaar", "bahut", "tum",
+               "raha", "rahi", "rahe", "gaya", "gayi", "sab", "kuch", "aur"}
+
+
+# Bharat ki alag-alag script -> language code (phone isi se TTS voice chunta hai).
+_SCRIPTS = (
+    (re.compile(r"[\u0900-\u097f]"), "hi"),    # Devanagari  (Hindi/Marathi)
+    (re.compile(r"[\u0980-\u09ff]"), "bn"),    # Bengali
+    (re.compile(r"[\u0a00-\u0a7f]"), "pa"),    # Gurmukhi    (Punjabi)
+    (re.compile(r"[\u0a80-\u0aff]"), "gu"),    # Gujarati
+    (re.compile(r"[\u0b00-\u0b7f]"), "or"),    # Odia
+    (re.compile(r"[\u0b80-\u0bff]"), "ta"),    # Tamil
+    (re.compile(r"[\u0c00-\u0c7f]"), "te"),    # Telugu
+    (re.compile(r"[\u0c80-\u0cff]"), "kn"),    # Kannada
+    (re.compile(r"[\u0d00-\u0d7f]"), "ml"),    # Malayalam
+    (re.compile(r"[\u0600-\u06ff]"), "ur"),    # Arabic script (Urdu)
+)
 
 
 def guess_language(text: str) -> str:
     """Small local heuristic so the phone can pick a matching text-to-speech voice."""
-    if DEVANAGARI.search(text):
-        return "hi"
+    for pattern, code in _SCRIPTS:
+        if pattern.search(text):
+            return code
     words = set(re.findall(r"[a-z]+", text.lower()))
     if words & ROMAN_HINDI:
         return "hinglish"
@@ -642,6 +667,15 @@ _SEARCH_TRIGGERS = (
     "pata karo", "check karo", "dekho internet", "सर्च करो", "गूगल करो", "इंटरनेट",
 )
 _YEAR = re.compile(r"\b(20[2-9]\d)\b")
+# "Abhi kaun CM/PM hai" jaisa sawaal - yahan AI ka purana gyaan galat ho sakta hai,
+# isliye in par hamesha live jaankari (khabar + Wikipedia) lete hain.
+_OFFICE_TRIGGERS = (
+    "chief minister", "cm ", " cm", "cm of", "mukhyamantri", "mukhya mantri",
+    "prime minister", "pm ", " pm", "pm of", "pradhanmantri", "pradhan mantri",
+    "president", "rashtrapati", "governor", "rajyapal", "mayor",
+    "मुख्यमंत्री", "मुख्य मंत्री", "प्रधानमंत्री", "प्रधान मंत्री", "राष्ट्रपति", "राज्यपाल",
+    "मेयर", "सरपंच",
+)
 _DEVANAGARI = re.compile(r"[\u0900-\u097f]")
 
 # Chhota city list: sawaal me naam mile to wahi, warna NEXORA_CITY (default Patna).
@@ -663,6 +697,8 @@ def wants_live_info(text: str) -> bool:
         return True
     if any(t in low for t in _NEWS_TRIGGERS) or any(t in text for t in _NEWS_TRIGGERS):
         return True
+    if wants_office(text):
+        return True
     return bool(_YEAR.search(low))
 
 
@@ -677,6 +713,13 @@ def city_from_text(text: str, default_city: str) -> str:
 def wants_weather(text: str) -> bool:
     low = text.lower()
     return any(t in low for t in _WEATHER_TRIGGERS) or any(t in text for t in _WEATHER_TRIGGERS)
+
+
+def wants_office(text: str) -> bool:
+    """Kaun abhi CM/PM/President hai - aise sawaalon par live jaankari zaroori hai."""
+    low = " " + text.lower() + " "
+    return (any(t in low for t in _OFFICE_TRIGGERS)
+            or any(t in text for t in _OFFICE_TRIGGERS))
 
 
 def wants_news(text: str) -> bool:
@@ -738,6 +781,19 @@ _NEWS_STOPWORDS = {
     "आज", "की", "का", "के", "को", "में", "है", "हैं", "सुनाओ", "बताओ", "खबर", "ख़बर",
     "ताज़ा", "न्यूज़", "समाचार",
 }
+
+
+def office_query(text: str) -> str:
+    """Wikipedia ke liye saaf sawaal: "who is the chief minister of bihar" -> "chief minister of bihar"."""
+    cleaned = re.sub(r"[^\w\s\u0900-\u097f]", " ", text.lower())
+    tokens = [t for t in cleaned.split() if len(t) > 1 and t not in _OFFICE_FILLER]
+    return " ".join(tokens[:8]).strip() or "chief minister"
+
+
+_OFFICE_FILLER = {"hey", "nexora", "who", "whose", "is", "the", "of", "kaun", "hai", "hain",
+                  "kya", "ka", "ki", "ke", "ko", "me", "mein", "tell", "me", "abhi", "current",
+                  "konsa", "kaunsa", "batao", "please", "आज", "कौन", "है", "हैं", "की", "का",
+                  "के", "को", "में", "बताओ"}
 
 
 def news_query(text: str) -> str:
@@ -837,6 +893,10 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
         jobs.append(weather_line(city_from_text(text, default_city), timeout))
     if wants_news(text):
         jobs.append(news_lines(text, timeout))
+    # Kaun CM/PM hai jaisa sawaal: Wikipedia + khabar dono (khabar me aaj ka naam hota hai).
+    if wants_office(text):
+        jobs.append(wiki_lines(office_query(text), timeout, limit=2))
+        jobs.append(news_lines(text, timeout, limit=3))
     if not jobs:  # koi khaas trigger nahi: Wikipedia facts
         jobs.append(wiki_lines(text, timeout))
     results = await asyncio.gather(*jobs, return_exceptions=True)
@@ -918,9 +978,10 @@ def clean_reply(text: str) -> str:
 # Jab internet se taaza jaankari mil jaye, tab prompt me yeh judta hai.
 LIVE_PROMPT_SUFFIX = (
     "\n\nLIVE INFORMATION just fetched from the internet:\n{info}\n"
-    "Use this live information to answer the question. Quote the numbers and names from it. "
-    "If the answer is not in the live information, say honestly in ONE short sentence that you "
-    "could not find it right now."
+    "Use this live information to answer the question, and TRUST IT over your own memory: if it "
+    "names a different person, number or date than you remember, the live information is the "
+    "correct one. Quote the names and numbers from it. If the answer is not in the live "
+    "information, say honestly in ONE short sentence that you could not find it right now."
 )
 
 
@@ -1203,7 +1264,7 @@ async def home() -> HTMLResponse:
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>NEXORA server</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;text-align:center;padding:40px">
 <h1 style="margin:0 0 6px">NEXORA server chal raha hai</h1>
-<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live} &nbsp;|&nbsp; camera vision: {eyes}</p>
+<p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live} &nbsp;|&nbsp; camera vision: {eyes} &nbsp;|&nbsp; languages: 13</p>
 <p style="font-size:20px"><span style="color:{dot};font-size:28px">&#9679;</span> {state}</p>
 <p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> par poora status JSON milta hai</p>
 </body></html>"""
