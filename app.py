@@ -32,6 +32,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Ye version /health aur server page par dikhta hai - upload hua ya nahi, isse turant pata
+# chal jaata hai (Render purana code chala raha ho to yahi number purana dikhega).
+BUNDLE_VERSION = "2026-10-16-livefacts2"
+
 DEFAULT_SYSTEM_PROMPT = (
     # NEXORA ki personality + sakht rules. Yeh lines phone ke TTS voice ke liye likhi gayi
     # hain: chhota jawaab, ek hi script, koi emoji/markdown/extra line nahi.
@@ -1457,11 +1461,55 @@ def person_party_subject(text: str) -> str | None:
     return " ".join(keep[:4]).strip()
 
 
-async def person_party_context(subject: str, timeout: float = 5.0) -> list[str]:
-    """Us bade aadmi ki party (Wikipedia page ke infobox se, warna Wikidata se).
+async def person_party_sparql(name: str, timeout: float = 5.0) -> list[str]:
+    """Wikidata SPARQL: naam ke label se seedha banda + uski party (P102).
 
-    Devanagari sawaal par Hindi Wikipedia dekhte hain, warna English - isse galat page
-    (jaise kisi aur neta ka) nahi khulta.
+    Ye sirf wikidata.org aur query.wikidata.org use karta hai - Render jaise server se bhi
+    pakka chalta hai (wahan Wikipedia ka API kabhi-kabhi 429 de deta hai).
+    """
+    clean = (name or "").strip().replace('"', "").replace("\\", "")
+    if not clean:
+        return []
+    key = f"persparql|{clean}"
+    hit, cached = _cache_get(key)
+    if hit:
+        return cached
+    lines: list[str] = []
+    for language in ("en", "hi"):
+        query = (
+            "SELECT ?personLabel ?partyLabel WHERE {{"
+            '  ?person rdfs:label "{label}"@{lang} .'
+            "  ?person wdt:P102 ?party ."
+            '  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,hi". }}'
+            "}} LIMIT 3"
+        ).format(label=clean, lang=language)
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
+                await _be_polite()
+                response = await client.get(
+                    "https://query.wikidata.org/sparql",
+                    params={"query": query, "format": "json"},
+                    headers={"Accept": "application/sparql-results+json"},
+                )
+                rows = (((response.json() or {}).get("results") or {}).get("bindings") or [])
+            if rows:
+                row = rows[0]
+                person = (row.get("personLabel") or {}).get("value")
+                party = (row.get("partyLabel") or {}).get("value")
+                if person and party:
+                    lines = [f"Live fact (Wikidata): the party of {person} is {party}."]
+                    break
+        except Exception:  # noqa: BLE001 - live source kabhi jawaab ko na roke
+            continue
+    _cache_put(key, lines)
+    return lines
+
+
+async def person_party_context(subject: str, timeout: float = 5.0) -> list[str]:
+    """Us bade aadmi ki party - teen free source (Wikidata SPARQL, Wikidata search, Wikipedia).
+
+    Devanagari sawaal par Hindi Wikipedia/Wikidata dekhte hain, warna English. Har source
+    fail ho to agla chalta hai, aur ek bhi line mil jaye to kaam khatam (time bachta hai).
     """
     if not subject:
         return []
@@ -1469,10 +1517,10 @@ async def person_party_context(subject: str, timeout: float = 5.0) -> list[str]:
     hit, cached_lines = _cache_get(key)
     if hit:
         return cached_lines
+    started = time.time()
     host = "hi" if _DEVANAGARI.search(subject) else "en"
-    lines: list[str] = []
     titles: list[str] = []
-    try:  # 1) Wikipedia par naam dhoondo ("nitish kumar" -> "Nitish Kumar")
+    try:  # Wikipedia par asli naam dhoondo ("nitish kumar" -> "Nitish Kumar")
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
             await _be_polite()
             search = await client.get(_wiki_api(host), params={
@@ -1483,16 +1531,27 @@ async def person_party_context(subject: str, timeout: float = 5.0) -> list[str]:
             titles = [h.get("title") for h in hits if h.get("title")]
     except Exception:  # noqa: BLE001
         titles = []
-    # Pehla hit sahi na ho (jaise "Modi" disambiguation), to agle 2 bhi dekh lo.
-    for title in titles[:3]:
-        party = await person_party_line(title, timeout, host)
-        if party:
-            lines.append(f"Live fact: the party of {title} is {party}.")
+    # Naam ke ummidwar: pehle Wikipedia ke natije, phir jaisa bolа gaya, phir bada akshar wala.
+    candidates: list[str] = []
+    for cand in (titles[:2] + [subject, subject.title()]):
+        cand = (cand or "").strip()
+        if cand and cand not in candidates:
+            candidates.append(cand)
+    lines: list[str] = []
+    for cand in candidates[:3]:
+        if time.time() - started > 6.0:   # jawaab der se na aaye
             break
-    if not lines:
-        # 2) Wikidata se party (P102) - page mila ho to usi naam se, warna seedha subject se.
-        search_term = titles[0] if titles else subject
-        lines = await _wikidata_person_party(search_term, timeout)
+        lines = await person_party_sparql(cand, timeout)          # 1) Wikidata SPARQL (pakka)
+        if not lines:
+            lines = await _wikidata_person_party(cand, timeout)   # 2) Wikidata search + P102
+        if not lines:
+            party = await person_party_line(cand, timeout, host)  # 3) Wikipedia infobox
+            if party:
+                # Chhote akshar wala naam saaf karo ("nitish kumar" -> "Nitish Kumar").
+                pretty = cand if not cand.islower() else cand.title()
+                lines = [f"Live fact: the party of {pretty} is {party}."]
+        if lines:
+            break
     _cache_put(key, lines)
     return lines
 
@@ -1568,6 +1627,58 @@ async def office_live_lines(office_en: str, place_en: str, timeout: float = 8.0,
         if line:
             out.append(line)
     return out
+
+
+async def live_source_report(text: str, default_city: str, timeout: float = 8.0,
+                            web_search_on: bool = True) -> dict:
+    """Debug report: is sawaal par kaun sa live source kya laata hai (server test ke liye).
+
+    /v1/livecheck isi ko use karta hai. Isse turant pata chalta hai ki server par live
+    jaankari ka rasta theek chal raha hai ya kisi source par rok lagi hai.
+    """
+    report: dict = {
+        "question": text,
+        "web_search_on": web_search_on,
+        "wants": {
+            "live_info": wants_live_info(text),
+            "office": wants_office(text),
+            "party": wants_party(text),
+            "news": wants_news(text),
+            "weather": wants_weather(text),
+        },
+        "sources": {},
+    }
+    try:
+        report["live_context"] = await live_context(text, default_city, timeout)
+    except Exception as exc:  # noqa: BLE001
+        report["live_context"] = f"ERR {type(exc).__name__}: {exc}"
+    parts = office_parts(text) or party_office_parts(text)
+    if parts:
+        office, place = parts
+        report["office"] = f"{office} of {place}"
+        for label, func in (("wikidata_sparql", wikidata_sparql_line),
+                            ("wiki_infobox", wiki_incumbent_line),
+                            ("wikidata_claims", wikidata_office_line)):
+            try:
+                report["sources"][label] = await func(office, place, timeout, True)
+            except Exception as exc:  # noqa: BLE001
+                report["sources"][label] = f"ERR {type(exc).__name__}: {exc}"
+    subject = None if parts else person_party_subject(text)
+    if subject:
+        report["person"] = subject
+        for label, func in (("person_party_sparql", person_party_sparql),
+                            ("person_wikidata_search", _wikidata_person_party),
+                            ("person_wiki_infobox", person_party_line)):
+            try:
+                report["sources"][label] = await func(subject, timeout)
+            except Exception as exc:  # noqa: BLE001
+                report["sources"][label] = f"ERR {type(exc).__name__}: {exc}"
+    if not parts and not subject:
+        try:
+            report["sources"]["wiki_lines"] = await wiki_lines(text, timeout, 2)
+        except Exception as exc:  # noqa: BLE001
+            report["sources"]["wiki_lines"] = f"ERR {type(exc).__name__}: {exc}"
+    return report
 
 
 async def live_context(text: str, default_city: str, timeout: float = 8.0) -> str | None:
@@ -1868,6 +1979,31 @@ def require_device(x_device_token: str | None = Header(default=None)) -> str:
     raise HTTPException(status_code=401, detail="bad_token")
 
 
+@app.get("/v1/livecheck")
+async def livecheck(q: str = "", token: str | None = None,
+                    x_device_token: str | None = Header(default=None)) -> dict:
+    """Debug: is sawaal par kaun sa LIVE source chala aur kya nikla (server theek hai ya nahi).
+
+    Phone se nahi, sirf browser se test karne ke liye. Token header me lagta hai:
+      GET /v1/livecheck?q=bihar+me+kis+party+ki+sarkar+hai  (header: x-device-token)
+    """
+    # Token header me ya seedhe link me (?token=...) - browser se test karna aasan ho.
+    provided = (x_device_token or token or "").strip()
+    allowed = not settings.device_tokens
+    for known in settings.device_tokens:
+        if provided and hmac.compare_digest(known, provided):
+            allowed = True
+            break
+    if not allowed:
+        raise HTTPException(status_code=401,
+                            detail="missing_token" if not provided else "bad_token")
+    text = (q or "").strip()
+    if not text:
+        return {"error": "q khaali hai", "bundle": BUNDLE_VERSION,
+                "example": "/v1/livecheck?q=bihar me kis party ki sarkar hai&token=YOUR_TOKEN"}
+    return await live_source_report(text, settings.city, settings.search_timeout_s, settings.web_search)
+
+
 @app.get("/health")
 async def health() -> dict:
     """Unauthenticated and secret-free: tells the phone whether the brain is usable."""
@@ -1882,6 +2018,7 @@ async def health() -> dict:
         "model": settings.provider_model,
         "brain_ready": ready,
         "tokens_configured": bool(settings.device_tokens),
+        "bundle": BUNDLE_VERSION,
         "vision": settings.vision_enabled,
         "speech": settings.tts_enabled,
         "speech_voices": sorted(tts.VOICE_BY_LANGUAGE),
