@@ -723,7 +723,7 @@ def wants_live_info(text: str) -> bool:
         return True
     if any(t in low for t in _NEWS_TRIGGERS) or any(t in text for t in _NEWS_TRIGGERS):
         return True
-    if wants_office(text):
+    if wants_office(text) or wants_party(text):
         return True
     return bool(_YEAR.search(low))
 
@@ -741,11 +741,41 @@ def wants_weather(text: str) -> bool:
     return any(t in low for t in _WEATHER_TRIGGERS) or any(t in text for t in _WEATHER_TRIGGERS)
 
 
+def place_from_text(text: str) -> str:
+    """Sawaal me jagah (rajya/city) ka English naam - Wikipedia/news ke liye. Nahi mile to ''."""
+    low = text.lower()
+    for hindi, english in _PLACE_EN.items():
+        if hindi in text:
+            return english
+    for roman, english in _PLACE_ROMAN.items():
+        if re.search(rf"\b{roman}\b", low):
+            return english
+    return ""
+
+
+def party_office_parts(text: str) -> tuple[str, str] | None:
+    """"bihar me kis party ki sarkar hai" -> ("chief minister", "bihar").
+
+    Yahan office ka lafz nahi hota, par jawaab wahi hai: kis party ki sarkar = us rajya ke
+    mukhyamantri aur unki party. Isliye party + jagah mile to CM wala source chalate hain.
+    """
+    if not wants_party(text):
+        return None
+    if office_parts(text):
+        return None
+    place = place_from_text(text)
+    if not place:
+        return None
+    return "chief minister", place
+
+
 def wants_office(text: str) -> bool:
     """Kaun abhi CM/PM/President hai - aise sawaalon par live jaankari zaroori hai."""
     low = " " + text.lower() + " "
-    return (any(t in low for t in _OFFICE_TRIGGERS)
-            or any(t in text for t in _OFFICE_TRIGGERS))
+    if any(t in low for t in _OFFICE_TRIGGERS) or any(t in text for t in _OFFICE_TRIGGERS):
+        return True
+    # "bihar me kis party ki sarkar hai" jaisa sawaal (office ka lafz nahi, par jawaab wahi).
+    return party_office_parts(text) is not None
 
 
 # "kis party ki sarkar hai", "party kaun si hai", "gathbandhan" - in sawaalon par
@@ -900,7 +930,7 @@ def office_query(text: str) -> str:
     "who is the chief minister of bihar" -> "bihar chief minister"
     "bihar ke cm kaun hai"               -> "bihar chief minister"
     """
-    parts = office_parts(text)
+    parts = office_parts(text) or party_office_parts(text)
     if parts:
         return f"{parts[1]} {parts[0]}".strip()
     low = text.lower()
@@ -929,6 +959,7 @@ async def weather_line(city: str, timeout: float) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                      headers={"User-Agent": "NEXORA-robot/1.0"}) as client:
+            await _be_polite()
             geo = await client.get("https://geocoding-api.open-meteo.com/v1/search",
                                    params={"name": city, "count": 1})
             results = (geo.json() or {}).get("results") or []
@@ -951,6 +982,7 @@ async def weather_line(city: str, timeout: float) -> str | None:
         pass
     try:  # fallback
         async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "curl/8"}) as client:
+            await _be_polite()
             r = await client.get(f"https://wttr.in/{quote(city)}", params={"format": "j1"})
             cur = ((r.json() or {}).get("current_condition") or [{}])[0]
             if cur.get("temp_C"):
@@ -970,6 +1002,7 @@ async def news_lines(query: str, timeout: float, limit: int = 4,
                + "&hl=en-IN&gl=IN&ceid=IN:en")
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                      headers={"User-Agent": "Mozilla/5.0"}) as client:
+            await _be_polite()
             r = await client.get(url)
         items = re.findall(r"<item>(.*?)</item>", r.text, re.S)[:limit]
         out = []
@@ -995,6 +1028,7 @@ async def wiki_lines(query: str, timeout: float, limit: int = 2) -> list[str]:
         }
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                      headers={"User-Agent": "NEXORA-robot/1.0"}) as client:
+            await _be_polite()
             r = await client.get(f"https://{host}/w/api.php", params=params)
         pages = ((r.json() or {}).get("query") or {}).get("pages") or {}
         out = []
@@ -1009,8 +1043,62 @@ async def wiki_lines(query: str, timeout: float, limit: int = 2) -> list[str]:
 
 # Wikipedia ke infobox se "abhi ka aadmi" - sabse seedha aur pakka tarika.
 _WIKI_EN_API = "https://en.wikipedia.org/w/api.php"
-_INCUMBENT_CACHE: dict = {}          # {key: (time, line)} - baar-baar wahi sawaal par API ko na pareshan karein
-_INCUMBENT_CACHE_TTL = 900.0         # 15 minute tak yaad rakho
+_WIKI_HI_API = "https://hi.wikipedia.org/w/api.php"
+
+
+def _wiki_api(host: str | None) -> str:
+    """Devanagari sawaal par Hindi Wikipedia, warna English Wikipedia."""
+    return _WIKI_HI_API if (host or "").startswith("hi") else _WIKI_EN_API
+_INCUMBENT_CACHE: dict = {}          # {key: (time, line, ttl)} - baar-baar wahi sawaal par API ko na pareshan karein
+_INCUMBENT_CACHE_TTL = 900.0         # sahi jawaab 15 minute tak yaad rakho
+_NEG_CACHE_TTL = 90.0                # jo nahi mila wo chhota waqt (90s) yaad rakho
+_NET_LOCK = asyncio.Lock()           # ek waqt me ek hi Wikimedia request
+_LAST_NET = 0.0
+_NET_SPACING = 0.7                   # do requests ke beech itna gap (429 se bachaav)
+
+
+async def _be_polite() -> None:
+    """Wikimedia/Wikidata par polite raho: ek waqt me ek request aur beech me thoda gap.
+
+    Wikimedia zyada requests par 429 "too many requests" de deta hai - tab tak koi live
+    fact nahi milta. Isliye spacing + ek lock rakhte hain.
+    """
+    global _LAST_NET
+    async with _NET_LOCK:
+        wait = _NET_SPACING - (time.time() - _LAST_NET)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _LAST_NET = time.time()
+
+
+def _cache_get(key: str):
+    """(mila?, line) - ttl ab har entry ke saath hai (negative jawaab chhota yaad rehta hai)."""
+    cached = _INCUMBENT_CACHE.get(key)
+    if cached and time.time() - cached[0] < cached[2]:
+        return True, cached[1]
+    return False, None
+
+
+def _cache_put(key: str, line) -> None:
+    ttl = _INCUMBENT_CACHE_TTL if line else _NEG_CACHE_TTL
+    _INCUMBENT_CACHE[key] = (time.time(), line, ttl)
+
+
+class _RateLimited(Exception):
+    """Wikimedia ne 429 (too many requests) diya - thoda ruk kar dobara try karo."""
+
+    def __init__(self, pause: float = 1.5):
+        super().__init__("rate limited")
+        self.pause = pause
+
+
+def _retry_after(response) -> float:
+    """429 aaya to Wikimedia ka bataya hua waqt (max 3s) - warna default."""
+    try:
+        value = float((response.headers.get("retry-after") or "").strip())
+        return max(0.0, min(value, 3.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _page_wikitext(payload: dict) -> str:
@@ -1049,47 +1137,73 @@ def party_from_wikitext(wikitext: str) -> str | None:
     if not match:
         return None
     raw = re.sub(r"<ref.*?</ref>|<ref[^>]*/>", "", match.group(1))
+    # Flag/logo wali file link hata do, warna party ki jagah "File:...Flag.svg" bol dete hain.
+    raw = re.sub(r"\[\[\s*(?:File|Image|Category)\s*:[^\[\]]*\]\]", " ", raw, flags=re.I)
     link = re.search(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", raw)
     if link:
         # Poora naam lo ("[[Bharatiya Janata Party|BJP]]" -> "Bharatiya Janata Party"),
-        # kyunki bolte waqt poora naam saaf samajh aata hai.
-        name = re.split(r"\(", link.group(1))[0].strip()
+        # kyunki bolte waqt poora naam saaf samajh aata hai. "Janata Dal (United)" ka
+        # (United) chhodna nahi hai, isliye yahan sirf "since wala" hissa hataate hain.
+        name = link.group(1).strip()
     else:
-        name = re.sub(r"\{\{[^}]*\}\}", "", raw).replace("[", "").replace("]", "").replace("'", "").strip()
-    name = re.split(r"[,<(]", name)[0].strip()
+        # Bahut pages aise likhte hain: {{Party index link|Bharatiya Janata Party}} {{Small|(since 2017)}}
+        template = re.search(r"\{\{[^{}|]*\|\s*([^{}|]+?)\s*(?:\|[^{}]*)?\}\}", raw)
+        if template:
+            name = template.group(1).strip()
+        else:
+            name = re.sub(r"\{\{[^}]*\}\}", "", raw).replace("[", "").replace("]", "").replace("'", "").strip()
+            name = re.split(r"[,<(]", name)[0].strip()
+    name = re.sub(r"\s*\((?:since|from|after)[^)]*\)", "", name).strip()
+    name = re.split(r"[,<]", name)[0].strip()
     if not name or len(name) > 60:
         return None
     return name
 
 
-async def person_party_line(name: str, timeout: float = 8.0) -> str | None:
+def party_phrase(party: str | None) -> str:
+    """Party ka phrase - naam me 'Party' pehle se ho to dobara nahi lagate."""
+    name = (party or "").strip()
+    if not name:
+        return ""
+    if re.search(r"\bparty\b", name, re.I) or "पार्टी" in name:
+        return f", of the {name}."
+    return f", of the {name} party."
+
+
+async def person_party_line(name: str, timeout: float = 8.0, host: str = "en") -> str | None:
     """Us aadmi ke Wikipedia page ke infobox se party ("Samrat Choudhary" -> "Bharatiya Janata Party")."""
     if not name:
         return None
-    key = f"party|{name}"
-    cached = _INCUMBENT_CACHE.get(key)
-    if cached and time.time() - cached[0] < _INCUMBENT_CACHE_TTL:
-        return cached[1]
+    key = f"party|{host}|{name}"
+    hit, cached_party = _cache_get(key)
+    if hit:
+        return cached_party
     line = None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3, 4):
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                          headers={"User-Agent": "NexoraRobot/1.0 (school project)"}) as client:
-                response = await client.get(_WIKI_EN_API, params={
+                await _be_polite()
+                response = await client.get(_wiki_api(host), params={
                     "action": "query", "prop": "revisions", "titles": name,
                     "rvprop": "content", "rvslots": "main", "format": "json", "redirects": "1",
                 })
+            if response.status_code == 429:
+                raise _RateLimited()
             text = response.text or ""
-            if not text.strip():
-                raise ValueError("khaali jawaab (rate limit?)")
+            if not text.strip() or not text.lstrip().startswith("{"):
+                raise ValueError("khaali jawaab")
             party = party_from_wikitext(_page_wikitext(response.json()))
             if party:
                 line = party
             break
+        except _RateLimited as exc:
+            if attempt < 4:
+                await asyncio.sleep(min(4.0, (exc.pause or 1.5) * attempt * 1.5))
         except Exception:  # noqa: BLE001
-            if attempt == 1:
-                await asyncio.sleep(1.5)
-    _INCUMBENT_CACHE[key] = (time.time(), line)
+            if attempt < 3:
+                await asyncio.sleep(1.5 * attempt)
+    _cache_put(key, line)
     return line
 
 
@@ -1102,39 +1216,45 @@ async def wiki_incumbent_line(office_en: str, place_en: str, timeout: float = 8.
     """
     if not office_en or not place_en:
         return None
-    key = f"{office_en}|{place_en}"
-    cached = _INCUMBENT_CACHE.get(key)
-    now = time.time()
-    if cached and now - cached[0] < _INCUMBENT_CACHE_TTL:
-        return cached[1]
+    # want_party bhi key me: warna naam wala jawaab cache se party wale jawaab ko dabaa deta hai.
+    key = f"{office_en}|{place_en}|{int(want_party)}"
+    hit, cached_line = _cache_get(key)
+    if hit:
+        return cached_line
     title = f"{office_en.title()} of {place_en.title()}"
     line = None
     person_name = None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3, 4):
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                          headers={"User-Agent": "NexoraRobot/1.0 (school project)"}) as client:
+                await _be_polite()
                 response = await client.get(_WIKI_EN_API, params={
                     "action": "query", "prop": "revisions", "titles": title,
                     "rvprop": "content", "rvslots": "main", "format": "json", "redirects": "1",
                 })
+            if response.status_code == 429:
+                raise _RateLimited()
             text = response.text or ""
-            if not text.strip():
-                raise ValueError("khaali jawaab (rate limit?)")
+            if not text.strip() or not text.lstrip().startswith("{"):
+                raise ValueError("khaali jawaab")
             wikitext = _page_wikitext(response.json())
             person_name = _incumbent_name(wikitext)
             if person_name:
                 line = f"Live fact: the current {office_en.title()} of {place_en.title()} is {person_name}."
             break
+        except _RateLimited as exc:
+            if attempt < 4:
+                await asyncio.sleep(min(4.0, (exc.pause or 1.5) * attempt * 1.5))
         except Exception:  # noqa: BLE001
-            if attempt == 1:
-                await asyncio.sleep(1.5)
+            if attempt < 3:
+                await asyncio.sleep(1.5 * attempt)
     if line and want_party and person_name:
         # Party sawaal: us aadmi ke page se party bhi laga do ("... is X, of the Y party.").
         party = await person_party_line(person_name, timeout)
         if party:
-            line = line.rstrip(".") + f", of the {party} party."
-    _INCUMBENT_CACHE[key] = (time.time(), line)
+            line = (line.rstrip(".") + party_phrase(party)).rstrip(".") + "."
+    _cache_put(key, line)
     return line
 
 
@@ -1179,6 +1299,7 @@ async def wikidata_office_line(office_en: str, place_en: str, timeout: float = 8
     query = f"{office_en} of {place_en}".strip()
     try:
         async with httpx.AsyncClient(timeout=timeout, headers=_WD_UA, follow_redirects=True) as client:
+            await _be_polite()
             found = await client.get(_WD_API, params={
                 "action": "wbsearchentities", "search": query, "language": "en",
                 "format": "json", "limit": 5,
@@ -1234,11 +1355,219 @@ async def wikidata_office_line(office_en: str, place_en: str, timeout: float = 8
             if not label:
                 return None
             since = f", in office since {start}" if start else ""
-            party = f", of the {party_label} party" if party_label else ""
+            party = party_phrase(party_label).rstrip(".") if party_label else ""
             return (f"Live fact (Wikidata): the current {office_en.title()} of "
                     f"{place_en.title()} is {label}{party}{since}.")
     except Exception:  # noqa: BLE001
         return None
+
+
+async def wikidata_sparql_line(office_en: str, place_en: str, timeout: float = 5.0,
+                               want_party: bool = True) -> str | None:
+    """Wikidata SPARQL se ABHI ka office holder - naam, party aur "since" ek hi sawaal me.
+
+    Ye sabse tez (0.3s) aur sabse pakka source hai: jo entry abhi chal rahi hai usi ka
+    "end time" (P582) nahi hota - wahi banda current hota hai.
+    """
+    if not office_en or not place_en:
+        return None
+    key = f"sparql|{office_en}|{place_en}"
+    hit, cached_line = _cache_get(key)
+    if hit:
+        return cached_line
+    now = time.time()
+    line = None
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
+            await _be_polite()
+            found = await client.get(_WD_API, params={
+                "action": "wbsearchentities", "search": f"{office_en} of {place_en}",
+                "language": "en", "format": "json", "limit": 5,
+            })
+            hits = (found.json() or {}).get("search", []) or []
+            wanted = set(office_en.split())
+            entity_id = None
+            for hit in hits:
+                label = (hit.get("label") or "").lower()
+                if wanted and all(word in label for word in wanted):
+                    entity_id = hit.get("id")
+                    break
+            if entity_id is None and hits:
+                entity_id = hits[0].get("id")
+            if not entity_id:
+                _cache_put(key, None)
+                return None
+            query = (
+                "SELECT ?pLabel ?partyLabel ?start WHERE {{"
+                "  wd:{qid} p:P1308 ?st . ?st ps:P1308 ?p ."
+                "  OPTIONAL {{ ?st pq:P580 ?start }}"
+                "  FILTER NOT EXISTS {{ ?st pq:P582 ?end }}"
+                "  OPTIONAL {{ ?p wdt:P102 ?party }}"
+                '  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,hi". }}'
+                "}} LIMIT 5"
+            ).format(qid=entity_id)
+            response = await client.get(
+                "https://query.wikidata.org/sparql",
+                params={"query": query, "format": "json"},
+                headers={"Accept": "application/sparql-results+json"},
+            )
+            rows = (((response.json() or {}).get("results") or {}).get("bindings") or [])
+            if rows:
+                row = rows[0]
+                name = (row.get("pLabel") or {}).get("value")
+                # Party usi ek SPARQL jawaab me aa jaati hai - isliye hamesha bhejte hain
+                # (cache bhi saaf rehta hai: wahi line, chahe sawaal me party ho ya na ho).
+                party = (row.get("partyLabel") or {}).get("value")
+                start = (row.get("start") or {}).get("value") or ""
+                if name and not _DEVANAGARI.search(name):
+                    since = f", in office since {start[:4]}" if start[:4] else ""
+                    line = (f"Live fact (Wikidata): the current {office_en.title()} of "
+                            f"{place_en.title()} is {name}{party_phrase(party).rstrip('.')}{since}.")
+    except Exception:  # noqa: BLE001 - live source kabhi jawaab ko na roke
+        line = None
+    _cache_put(key, line)
+    return line
+
+
+_PERSON_FILLER = (
+    "hey", "nexora", "suno", "sun", "batao", "bata", "bataiye", "tell", "about", "me",
+    "kis", "kaun", "kaunsa", "kaunsi", "kaun-si", "konsa", "konsi", "which", "what",
+    "whose", "party", "parti", "sarkar", "government", "belongs", "belong", "to", "of",
+    "from", "se", "ke", "ka", "ki", "ko", "mein", "hain", "hai", "ho", "hu", "he",
+    "karti", "karta", "karte", "please", "current", "abhi", "aaj", "bhai", "ji",
+    "नेता", "किस", "कौन", "कौनसी", "कौन-सी", "पार्टी", "सरकार", "से", "के", "का", "की",
+    "को", "में", "है", "हैं", "बताओ", "बताइए", "जी", "आज", "अभी",
+)
+
+
+def person_party_subject(text: str) -> str | None:
+    """"nitish kumar kis party ke hain" -> "nitish kumar".
+
+    Sirf wahi sawaal jahan kisi BANDE ki party poochi gayi ho; rajya/office wale sawaal
+    ("bihar me kis party ki sarkar hai") office branch me jaate hain, isliye yahan None.
+    """
+    if not wants_party(text):
+        return None
+    if office_parts(text) or party_office_parts(text):
+        return None
+    tokens = re.split(r"[^0-9A-Za-z\u0900-\u097f]+", text.lower())
+    keep = [t for t in tokens if len(t) > 2 and t not in _PERSON_FILLER]
+    if not keep:
+        return None
+    return " ".join(keep[:4]).strip()
+
+
+async def person_party_context(subject: str, timeout: float = 5.0) -> list[str]:
+    """Us bade aadmi ki party (Wikipedia page ke infobox se, warna Wikidata se).
+
+    Devanagari sawaal par Hindi Wikipedia dekhte hain, warna English - isse galat page
+    (jaise kisi aur neta ka) nahi khulta.
+    """
+    if not subject:
+        return []
+    key = f"persparty|{subject}"
+    hit, cached_lines = _cache_get(key)
+    if hit:
+        return cached_lines
+    host = "hi" if _DEVANAGARI.search(subject) else "en"
+    lines: list[str] = []
+    titles: list[str] = []
+    try:  # 1) Wikipedia par naam dhoondo ("nitish kumar" -> "Nitish Kumar")
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
+            await _be_polite()
+            search = await client.get(_wiki_api(host), params={
+                "action": "query", "list": "search", "srsearch": subject, "srlimit": "3",
+                "format": "json",
+            })
+            hits = (((search.json() or {}).get("query") or {}).get("search") or [])
+            titles = [h.get("title") for h in hits if h.get("title")]
+    except Exception:  # noqa: BLE001
+        titles = []
+    # Pehla hit sahi na ho (jaise "Modi" disambiguation), to agle 2 bhi dekh lo.
+    for title in titles[:3]:
+        party = await person_party_line(title, timeout, host)
+        if party:
+            lines.append(f"Live fact: the party of {title} is {party}.")
+            break
+    if not lines:
+        # 2) Wikidata se party (P102) - page mila ho to usi naam se, warna seedha subject se.
+        search_term = titles[0] if titles else subject
+        lines = await _wikidata_person_party(search_term, timeout)
+    _cache_put(key, lines)
+    return lines
+
+
+async def _wikidata_person_party(name: str, timeout: float = 5.0) -> list[str]:
+    """Wikidata par bunde ka P102 (party) - dono bhasha try karte hain."""
+    for language in ("en", "hi"):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
+                await _be_polite()
+                found = await client.get(_WD_API, params={
+                    "action": "wbsearchentities", "search": name, "language": language,
+                    "format": "json", "limit": 5,
+                })
+                hits = ((found.json() or {}).get("search") or [])
+                # Politician wale hit pehle (naam ke aur matlab bhi ho sakte hain).
+                hits.sort(key=lambda h: 0 if re.search(
+                    r"politic|minister|leader|chief minister|prime minister",
+                    (h.get("description") or ""), re.I) else 1)
+                for person in hits[:3]:
+                    person_id = person.get("id")
+                    label = person.get("label") or name
+                    if not person_id:
+                        continue
+                    await _be_polite()
+                    claims = await client.get(_WD_API, params={
+                        "action": "wbgetentities", "ids": person_id, "props": "claims",
+                        "format": "json",
+                    })
+                    rows = ((((claims.json() or {}).get("entities") or {}).get(person_id) or {})
+                            .get("claims") or {}).get("P102", []) or []
+                    party_id = None
+                    for row in rows:
+                        value = ((row.get("mainsnak", {}) or {}).get("datavalue", {}) or {}).get("value", {})
+                        if isinstance(value, dict) and value.get("id"):
+                            party_id = value.get("id")
+                            break
+                    if not party_id:
+                        continue
+                    await _be_polite()
+                    labels = await client.get(_WD_API, params={
+                        "action": "wbgetentities", "ids": party_id, "props": "labels",
+                        "languages": "en|hi", "format": "json",
+                    })
+                    party_labels = ((((labels.json() or {}).get("entities") or {})
+                                     .get(party_id) or {}).get("labels") or {})
+                    party = ((party_labels.get("en") or {}).get("value")
+                             or (party_labels.get("hi") or {}).get("value"))
+                    if party:
+                        return [f"Live fact (Wikidata): the party of {label} is {party}."]
+        except Exception:  # noqa: BLE001
+            continue
+    return []
+
+
+async def office_live_lines(office_en: str, place_en: str, timeout: float = 8.0,
+                            want_party: bool = False) -> list[str]:
+    """ABHI ka office holder - teen free source try karte hain (order: tez aur pakka pehle)."""
+    started = time.time()
+    out: list[str] = []
+    # 1) Wikidata SPARQL: naam + party ek saath, sabse tez.
+    line = await wikidata_sparql_line(office_en, place_en, min(timeout, 5.0), want_party)
+    if line:
+        out.append(line)
+    # 2) Wikipedia infobox: doosri nazar (agar pehla fail hua ya poora nahi mila).
+    if (not out or (want_party and "of the" not in out[0])) and time.time() - started < 5.0:
+        line = await wiki_incumbent_line(office_en, place_en, min(timeout, 5.0), want_party)
+        if line:
+            out.append(line)
+    # 3) Purana Wikidata claims tarika - backup.
+    if not out and time.time() - started < 8.0:
+        line = await wikidata_office_line(office_en, place_en, min(timeout, 4.0), want_party)
+        if line:
+            out.append(line)
+    return out
 
 
 async def live_context(text: str, default_city: str, timeout: float = 8.0) -> str | None:
@@ -1263,6 +1592,11 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
                         place = english
                         break
             jobs.append(news_lines(f"{place} election result".strip(), timeout, limit=3, freshness="30d"))
+    # "Nitish Kumar kis party ke hain" jaisa sawaal: us bade aadmi ki party.
+    if not wants_office(text):
+        subject = person_party_subject(text)
+        if subject:
+            jobs.append(person_party_context(subject, timeout))
     # Kaun CM/PM hai jaisa sawaal: Wikipedia + khabar dono (khabar me aaj ka naam hota hai).
     if wants_office(text):
         # English keywords me dhoondo: "bihar chief minister" jaisi query par aaj ki khabar
@@ -1270,10 +1604,11 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
         clean = office_query(text)
         # 1) Sabse pakka: Wikipedia infobox + Wikidata - dono se abhi ka office holder
         #    (khabar par nirbhar nahi; dono free aur bina key ke hain).
-        parts = office_parts(text)
+        parts = office_parts(text) or party_office_parts(text)
         if parts:
-            jobs.append(wiki_incumbent_line(parts[0], parts[1], timeout, want_party(text)))
-            jobs.append(wikidata_office_line(parts[0], parts[1], timeout, want_party(text)))
+            # Dono source ek ke baad ek (parallel nahi): Wikimedia/Wikidata ek saath bahut
+            # requests par 429 "too many requests" deta hai - isliye line se chalta hai.
+            jobs.append(office_live_lines(parts[0], parts[1], timeout, wants_party(text)))
         # 2) 2 din ki taaza khabar: isi me aaj ka naam hota hai ("Bihar CM Samrat...").
         jobs.append(news_lines(clean, timeout, limit=3))
         jobs.append(wiki_lines(clean, timeout, limit=2))
@@ -1291,7 +1626,7 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
             lines.extend(result)
     # Context chhota rakhte hain (prompt sasta, jawaab tez). Office sawaal me thoda bada,
     # kyunki wahan khabar ke headlines hi naam batate hain.
-    budget = 7 if wants_office(text) else 5
+    budget = 7 if (wants_office(text) or wants_party(text)) else 5
     lines = [ln for ln in lines if ln.strip()][:budget]
     return "\n".join(f"- {ln}" for ln in lines) if lines else None
 
