@@ -34,7 +34,7 @@ load_dotenv()
 
 # Ye version /health aur server page par dikhta hai - upload hua ya nahi, isse turant pata
 # chal jaata hai (Render purana code chala raha ho to yahi number purana dikhega).
-BUNDLE_VERSION = "2026-10-16-livefacts2"
+BUNDLE_VERSION = "2026-10-16-livefacts3"
 
 DEFAULT_SYSTEM_PROMPT = (
     # NEXORA ki personality + sakht rules. Yeh lines phone ke TTS voice ke liye likhi gayi
@@ -67,7 +67,19 @@ DEFAULT_SYSTEM_PROMPT = (
     "11. Factual questions about politics, government, elections and current affairs ARE allowed: "
     "answer them with the given Live facts (names, party, posts, results) in one or two plain "
     "sentences. Never refuse such a factual question and never give opinions, predictions or "
-    "criticism about any party or leader."
+    "criticism about any party or leader. This includes ministers: if a Live fact names the "
+    "current Education/Health/Finance/Home/Sports minister, say that name straight away.\n"
+    "12. The user is a school student. His school is {school_name} (address: Bankatwa, Bagaha-1, "
+    "West Champaran, Bihar) and its principal is {school_principal}. If he asks about his school, "
+    "school name, principal or head, answer with these facts in one short sentence, proudly. If "
+    "asked who the principal is, say {school_principal}. Never say you do not know these.\n"
+    "13. Sports: answer every sports question (players, teams, rules, records, tournaments) with "
+    "real facts, 1-2 sentences. About football's greatest player: Cristiano Ronaldo is the GOAT - "
+    "if the user says Ronaldo is the GOAT, agree with him happily. Never say any other player is "
+    "greater than Ronaldo; if asked about Messi, praise his skill in a few words but keep Ronaldo "
+    "as the greatest.\n"
+    "14. Indian states and union territories: answer any fact about any state - capital, chief "
+    "minister, language, famous places, food, festivals. Use the Live facts when they are given."
 )
 
 
@@ -215,7 +227,12 @@ def get_settings() -> Settings:
         vision_models=vision_models,
         max_image_bytes=_as_int("MAX_IMAGE_BYTES", 350000, 20000),
         vision_timeout_s=_as_float("VISION_TIMEOUT_S", 40.0, 10.0),
-        system_prompt=os.getenv("SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT,
+        system_prompt=(os.getenv("SYSTEM_PROMPT", "").strip()
+                       or DEFAULT_SYSTEM_PROMPT.format(
+                           school_name=os.getenv("SCHOOL_NAME", "").strip()
+                           or "Montfort Senior Secondary School, Bagaha 1",
+                           school_principal=os.getenv("SCHOOL_PRINCIPAL", "").strip()
+                           or "Bro. Vincent Madhanu")),
     )
 
 # ===================== merged from app/providers.py =====================
@@ -729,6 +746,8 @@ def wants_live_info(text: str) -> bool:
         return True
     if wants_office(text) or wants_party(text):
         return True
+    if wants_sports_score(text):
+        return True
     return bool(_YEAR.search(low))
 
 
@@ -779,7 +798,10 @@ def wants_office(text: str) -> bool:
     if any(t in low for t in _OFFICE_TRIGGERS) or any(t in text for t in _OFFICE_TRIGGERS):
         return True
     # "bihar me kis party ki sarkar hai" jaisa sawaal (office ka lafz nahi, par jawaab wahi).
-    return party_office_parts(text) is not None
+    if party_office_parts(text) is not None:
+        return True
+    # "bihar ke shiksha mantri kaun hai" jaisa sawaal (mantri ka portfolio).
+    return portfolio_parts(text) is not None
 
 
 # "kis party ki sarkar hai", "party kaun si hai", "gathbandhan" - in sawaalon par
@@ -794,6 +816,65 @@ def wants_party(text: str) -> bool:
     """Sawaal me party/sarkar ki baat hai? (tab Live fact me party bhi bhejte hain)"""
     low = text.lower()
     return any(t in low for t in _PARTY_TRIGGERS) or any(t in text for t in _PARTY_TRIGGERS)
+
+
+# Mantri wale portfolio: "bihar ke shiksha mantri kaun hai" -> education + bihar.
+_PORTFOLIO_EN = (
+    (("shiksha", "education", "शिक्षा", "सिक्षा"), "education"),
+    (("swasthya", "swasth", "health", "स्वास्थ्य", "सेहत"), "health"),
+    (("vitt", "vith", "finance", "vit mantri", "वित्त"), "finance"),
+    (("grih", "home minister", "गृह"), "home"),
+    (("khel", "sports", "sport", "खेल"), "sports"),
+    (("vidhi", "law minister", "विधि"), "law"),
+    (("parivahan", "transport", "परिवहन"), "transport"),
+    (("krishi", "agriculture", "कृषि"), "agriculture"),
+    (("urja", "energy", "power minister", "ऊर्जा", "बिजली"), "energy"),
+    (("paryatan", "tourism", "पर्यटन"), "tourism"),
+    (("shram", "labour", "labor", "श्रम"), "labour"),
+    (("shahar vikas", "nagar vikas", "urban development", "शहरी विकास"), "urban development"),
+)
+
+
+def portfolio_from_text(text: str) -> str | None:
+    """Sawaal me kaun sa mantralaya (portfolio) hai - English naam me."""
+    low = text.lower()
+    for words, english in _PORTFOLIO_EN:
+        for word in words:
+            if word in low or word in text:
+                return english
+    return None
+
+
+def portfolio_parts(text: str) -> tuple[str, str] | None:
+    """Sawaal se (portfolio, jagah): ("education", "bihar"). Na mile to None."""
+    portfolio = portfolio_from_text(text)
+    if not portfolio:
+        return None
+    # Sahi jagah: pehle saaf jagah, warna state/city ke naam ka andaza.
+    place = place_from_text(text)
+    if not place:
+        return None
+    return portfolio, place
+
+
+_SPORTS_WORDS = (
+    "match", "score", "khel", "khiladi", "player", "cricket", "football", "hockey", "tennis",
+    "kabaddi", "olympic", "world cup", "ipl", "ranji", "test match", "odi", "t20", "fifa",
+    "uefa", "ronaldo", "messi", "kohli", "dhoni", "sachin", "virat", "gk", "गोल",
+    "मैच", "क्रिकेट", "फुटबॉल", "हॉकी", "खेल", "खिलाड़ी", "विश्व कप", "रोनाल्डो", "मेसी",
+)
+# Sirf WO sawaal jahan aaj ka natija chaahiye (knowledge wale sawaal LLM khud janta hai).
+_SCORE_WORDS = ("score", "result", "kaun jita", "kaun jeeta", "kon jita", "match kaun",
+                "aaj ka match", "aaj ka score", "khel ka natija", "natija", "live score",
+                "जीता", "स्कोर", "नतीजा", "मैच")
+
+
+def wants_sports_score(text: str) -> bool:
+    """Aaj ka match/score poocha gaya hai? (sports gyaan nahi - wo AI khud janta hai)."""
+    low = text.lower()
+    if not any(w in low or w in text for w in _SPORTS_WORDS):
+        return False
+    return any(w in low or w in text for w in _SCORE_WORDS)
 
 
 def wants_news(text: str) -> bool:
@@ -876,6 +957,14 @@ _OFFICE_EN = {
     "upmukhyamantri": "deputy chief minister",
 }
 # Rajya/desh ke naam Devanagari se English (news + Wikipedia dono ke liye zaroori).
+_PLACE_EN_MORE = {
+    "अरुणाचल": "arunachal pradesh", "मिज़ोरम": "mizoram", "मेघालय": "meghalaya",
+    "नागालैंड": "nagaland", "पुदुचेरी": "puducherry", "पांडिचेरी": "puducherry",
+    "लद्दाख": "ladakh", "लक्षद्वीप": "lakshadweep", "अंडमान": "andaman and nicobar islands",
+    "दादरा": "dadra and nagar haveli", "दमन": "daman and diu", "चंडीगढ़": "chandigarh",
+    "जम्मू": "jammu and kashmir", "कश्मीर": "jammu and kashmir",
+}
+
 _PLACE_EN = {
     "बिहार": "bihar", "उत्तर प्रदेश": "uttar pradesh", "मध्य प्रदेश": "madhya pradesh",
     "महाराष्ट्र": "maharashtra", "राजस्थान": "rajasthan", "गुजरात": "gujarat",
@@ -889,6 +978,7 @@ _PLACE_EN = {
     "दिल्ली": "delhi", "पटना": "patna", "मुंबई": "mumbai", "कोलकाता": "kolkata",
     "चेन्नई": "chennai", "भारत": "india",
 }
+_PLACE_EN.update(_PLACE_EN_MORE)
 # Hinglish/Hindi ke aam rajya-naam (Roman me) - news query ke liye.
 _PLACE_ROMAN = {
     "bihar": "bihar", "up": "uttar pradesh", "uttar": "uttar pradesh", "mp": "madhya pradesh",
@@ -896,6 +986,18 @@ _PLACE_ROMAN = {
     "haryana": "haryana", "jharkhand": "jharkhand", "bengal": "west bengal", "odisha": "odisha",
     "karnataka": "karnataka", "kerala": "kerala", "telangana": "telangana", "assam": "assam",
     "delhi": "delhi", "patna": "patna", "india": "india",
+    # Baaki rajya/UT: ab kisi bhi rajya ka CM/mantri wala sawaal chalega.
+    "andhra": "andhra pradesh", "arunachal": "arunachal pradesh", "goa": "goa",
+    "himachal": "himachal pradesh", "chhattisgarh": "chhattisgarh", "manipur": "manipur",
+    "meghalaya": "meghalaya", "mizoram": "mizoram", "nagaland": "nagaland", "sikkim": "sikkim",
+    "tripura": "tripura", "uttarakhand": "uttarakhand", "tamil": "tamil nadu",
+    "tamilnadu": "tamil nadu", "andhra pradesh": "andhra pradesh",
+    "himachal pradesh": "himachal pradesh", "west bengal": "west bengal",
+    "madhya pradesh": "madhya pradesh", "uttar pradesh": "uttar pradesh",
+    "arunachal pradesh": "arunachal pradesh", "jammu": "jammu and kashmir",
+    "kashmir": "jammu and kashmir", "ladakh": "ladakh", "puducherry": "puducherry",
+    "pondicherry": "puducherry", "chandigarh": "chandigarh", "lakshadweep": "lakshadweep",
+    "andaman": "andaman and nicobar islands", "sikkim": "sikkim",
 }
 
 
@@ -937,6 +1039,9 @@ def office_query(text: str) -> str:
     parts = office_parts(text) or party_office_parts(text)
     if parts:
         return f"{parts[1]} {parts[0]}".strip()
+    portfolio = portfolio_parts(text)
+    if portfolio:
+        return f"{portfolio[1]} {portfolio[0]} minister".strip()
     low = text.lower()
     # Purana behaviour (kuch aur office-type sawaal): filler hata kar shabd rakh lo.
     cleaned = re.sub(r"[^\w\s\u0900-\u097f]", " ", low)
@@ -1174,6 +1279,108 @@ def party_phrase(party: str | None) -> str:
     return f", of the {name} party."
 
 
+async def _wiki_raw(title: str, timeout: float = 6.0, _hops: int = 0) -> str:
+    """Wikipedia se seedha wikitext (action=raw) - tez aur bina 429 ke.
+
+    api.php ke muqable ye rasta kabhi "too many requests" nahi deta (0.1s me jawaab),
+    isliye ye pehla rasta hai. Redirect ho to khud follow karta hai.
+    """
+    if not title or _hops > 3:
+        return ""
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
+                await _be_polite()
+                response = await client.get("https://en.wikipedia.org/w/index.php",
+                                            params={"title": title, "action": "raw"})
+            text = response.text or ""
+            if response.status_code != 200 or not text.strip() or "too many requests" in text[:120].lower():
+                return ""
+            redirect = re.match(r"\s*#(?:REDIRECT|redirect)\s*:?\s*\[\[([^\]|#]+)", text)
+            if redirect:
+                return await _wiki_raw(redirect.group(1).strip(), timeout, _hops + 1)
+            return text
+        except Exception:  # noqa: BLE001
+            if attempt == 1:
+                await asyncio.sleep(1.0)
+    return ""
+
+
+async def _wikitext_for(title: str, timeout: float = 6.0) -> str:
+    """Page ka wikitext - pehle raw (tez), na chale to api.php."""
+    text = await _wiki_raw(title, timeout)
+    if text:
+        return text
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
+                await _be_polite()
+                response = await client.get(_WIKI_EN_API, params={
+                    "action": "query", "prop": "revisions", "titles": title,
+                    "rvprop": "content", "rvslots": "main", "format": "json", "redirects": "1",
+                })
+            if response.status_code == 429:
+                raise _RateLimited()
+            if not response.text.lstrip().startswith("{"):
+                return ""
+            return _page_wikitext(response.json())
+        except _RateLimited as exc:
+            if attempt < 3:
+                await asyncio.sleep(min(4.0, (exc.pause or 1.5) * attempt * 1.5))
+        except Exception:  # noqa: BLE001
+            return ""
+    return ""
+
+
+def _plain(value: str) -> str:
+    """Wikitext ki line se saaf naam/text (links, refs, templates hata kar)."""
+    text = re.sub(r"<ref.*?</ref>|<ref[^>]*/>", "", value or "")
+    # Photo/flag wale link ([[File:Nishant Kumar.jpg]]) hata do - naam inme nahi hota.
+    text = re.sub(r"\[\[\s*(?:File|Image|Category)\s*:[^\[\]]*\]\]", " ", text, flags=re.I)
+    text = re.sub(r"\{\{[^{}]*\}\}", " ", text)
+    text = re.sub(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", lambda m: m.group(2) or m.group(1), text)
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+    text = text.replace("[", "").replace("]", "").replace("'", "").strip()
+    return re.sub(r"\s{2,}", " ", text).strip(" ,")
+
+
+_PORTFOLIO_STOPWORDS = {"higher", "technical", "school", "secondary", "primary", "medical",
+                        "elementary", "adult", "rural"}
+
+
+def _minister_from_ministry_page(wikitext: str, portfolio_en: str) -> tuple[str, str] | None:
+    """CM ki ministry page (jaise "Choudhary ministry") se us portfolio ka mantri.
+
+    Page me aise blocks hote hain:
+      {{Cabinet table minister
+       | title     = [[List of ministers of education of Bihar|Education]]
+       | minister2 = [[Mithlesh Tiwari]]
+       | minister2_party = Bharatiya Janata Party}}
+    """
+    if not wikitext or not portfolio_en:
+        return None
+    for block in re.split(r"\{\{Cabinet table minister", wikitext)[1:]:
+        end = block.find("}}")
+        body = block[:end if end != -1 else len(block)]
+        title_match = re.search(r"\|\s*title\s*=\s*([^\n]+)", body)
+        if not title_match:
+            continue
+        title_text = _plain(title_match.group(1)).lower()
+        tokens = set(re.split(r"[^a-z]+", title_text))
+        if portfolio_en not in tokens or (tokens & _PORTFOLIO_STOPWORDS):
+            continue
+        name_match = re.search(r"\|\s*minister\d?\s*=\s*([^\n]+)", body)
+        if not name_match:
+            continue
+        name = _plain(name_match.group(1))
+        if not name:
+            continue
+        party_match = re.search(r"\|\s*minister\d?_party\s*=\s*([^\n]+)", body)
+        party = _plain(party_match.group(1)) if party_match else ""
+        return name, party
+    return None
+
+
 async def person_party_line(name: str, timeout: float = 8.0, host: str = "en") -> str | None:
     """Us aadmi ke Wikipedia page ke infobox se party ("Samrat Choudhary" -> "Bharatiya Janata Party")."""
     if not name:
@@ -1183,30 +1390,21 @@ async def person_party_line(name: str, timeout: float = 8.0, host: str = "en") -
     if hit:
         return cached_party
     line = None
-    for attempt in (1, 2, 3, 4):
+    if host.startswith("hi"):   # Hindi page: api.php hi chalta hai (raw bhi wahi host se)
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
-                                         headers={"User-Agent": "NexoraRobot/1.0 (school project)"}) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=_WD_UA) as client:
                 await _be_polite()
-                response = await client.get(_wiki_api(host), params={
+                response = await client.get(_WIKI_HI_API, params={
                     "action": "query", "prop": "revisions", "titles": name,
                     "rvprop": "content", "rvslots": "main", "format": "json", "redirects": "1",
                 })
-            if response.status_code == 429:
-                raise _RateLimited()
-            text = response.text or ""
-            if not text.strip() or not text.lstrip().startswith("{"):
-                raise ValueError("khaali jawaab")
-            party = party_from_wikitext(_page_wikitext(response.json()))
-            if party:
-                line = party
-            break
-        except _RateLimited as exc:
-            if attempt < 4:
-                await asyncio.sleep(min(4.0, (exc.pause or 1.5) * attempt * 1.5))
+            if response.status_code == 200 and response.text.lstrip().startswith("{"):
+                line = party_from_wikitext(_page_wikitext(response.json()))
         except Exception:  # noqa: BLE001
-            if attempt < 3:
-                await asyncio.sleep(1.5 * attempt)
+            line = None
+    else:
+        wikitext = await _wikitext_for(name, min(timeout, 6.0))
+        line = party_from_wikitext(wikitext or "")
     _cache_put(key, line)
     return line
 
@@ -1228,31 +1426,11 @@ async def wiki_incumbent_line(office_en: str, place_en: str, timeout: float = 8.
     title = f"{office_en.title()} of {place_en.title()}"
     line = None
     person_name = None
-    for attempt in (1, 2, 3, 4):
-        try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
-                                         headers={"User-Agent": "NexoraRobot/1.0 (school project)"}) as client:
-                await _be_polite()
-                response = await client.get(_WIKI_EN_API, params={
-                    "action": "query", "prop": "revisions", "titles": title,
-                    "rvprop": "content", "rvslots": "main", "format": "json", "redirects": "1",
-                })
-            if response.status_code == 429:
-                raise _RateLimited()
-            text = response.text or ""
-            if not text.strip() or not text.lstrip().startswith("{"):
-                raise ValueError("khaali jawaab")
-            wikitext = _page_wikitext(response.json())
-            person_name = _incumbent_name(wikitext)
-            if person_name:
-                line = f"Live fact: the current {office_en.title()} of {place_en.title()} is {person_name}."
-            break
-        except _RateLimited as exc:
-            if attempt < 4:
-                await asyncio.sleep(min(4.0, (exc.pause or 1.5) * attempt * 1.5))
-        except Exception:  # noqa: BLE001
-            if attempt < 3:
-                await asyncio.sleep(1.5 * attempt)
+    # Pehle tez raw rasta (429 nahi deta), na chale to api.php (_wikitext_for khud dekhta hai).
+    wikitext = await _wikitext_for(title, min(timeout, 6.0))
+    person_name = _incumbent_name(wikitext or "")
+    if person_name:
+        line = f"Live fact: the current {office_en.title()} of {place_en.title()} is {person_name}."
     if line and want_party and person_name:
         # Party sawaal: us aadmi ke page se party bhi laga do ("... is X, of the Y party.").
         party = await person_party_line(person_name, timeout)
@@ -1364,6 +1542,86 @@ async def wikidata_office_line(office_en: str, place_en: str, timeout: float = 8
                     f"{place_en.title()} is {label}{party}{since}.")
     except Exception:  # noqa: BLE001
         return None
+
+
+_PORTFOLIO_TITLE = {
+    "education": "education", "health": "health", "finance": "finance", "home": "home",
+    "sports": "sports", "law": "law", "transport": "transport", "agriculture": "agriculture",
+    "energy": "energy", "tourism": "tourism", "labour": "labour",
+    "urban development": "urban development",
+}
+
+
+def _current_minister_from_list(wikitext: str) -> str | None:
+    """"List of ministers of X of Y" table se ABHI ka minister.
+
+    Table ke rows aise hote hain:
+      |28
+      |[[Vijay Kumar Chaudhary]]
+      |15 April 2026
+      |07 May 2026
+      |[[Samrat Choudhary]]
+      |[[Janata Dal (United)]]
+    Jis row me term-end ki jagah "present" likha ho, wahi abhi kursi par hai.
+    """
+    if not wikitext:
+        return None
+    # Har row ko "|-" par tod do aur "present" wala aakhri row lo.
+    rows = re.split(r"\|-", wikitext)
+    for row in reversed(rows):
+        low = row.lower()
+        if "present" not in low and "incumbent" not in low:
+            continue
+        # Row me kai link hote hain - photo (File:) aur party wale chhod kar pehla naam lo.
+        for link in re.finditer(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", row):
+            name = _plain(link.group(0))
+            if not name or len(name) > 60:
+                continue
+            if re.match(r"(?i)\s*(file|image|category)\s*:", link.group(1) or ""):
+                continue
+            if re.search(r"(?i)minister|party|list of|politician", name):
+                continue
+            return name
+    return None
+
+
+async def portfolio_minister_line(portfolio_en: str, place_en: str, timeout: float = 8.0) -> str | None:
+    """Us rajya ke us portfolio ke ABHI ke mantri ka naam.
+
+    Teen rasta: 1) "List of ministers of education of Bihar" page, 2) CM ki ministry page
+    ("Choudhary ministry") ke cabinet table se, 3) khabar (wo live_context me lagti hai).
+    """
+    if not portfolio_en or not place_en:
+        return None
+    key = f"portfolio|{portfolio_en}|{place_en}"
+    hit, cached = _cache_get(key)
+    if hit:
+        return cached
+    word = _PORTFOLIO_TITLE.get(portfolio_en, portfolio_en)
+    place = place_en.title()
+    name = None
+    party = ""
+    # 1) List of ministers of <portfolio> of <state>
+    text = await _wikitext_for(f"List of ministers of {word} of {place}", min(timeout, 6.0))
+    if text:
+        found = _current_minister_from_list(text)
+        if found:
+            name = found
+    # 2) CM ki ministry page ka cabinet table (naam + party dono milte hain)
+    if not name:
+        for title in (f"{place} ministry", f"Government of {place}"):
+            text = await _wikitext_for(title, min(timeout, 6.0))
+            found = _minister_from_ministry_page(text, portfolio_en)
+            if found:
+                name, party = found
+                break
+    line = None
+    if name:
+        suffix = party_phrase(party).rstrip(".") if party else ""
+        line = (f"Live fact: the current {portfolio_en.title()} Minister of "
+                f"{place} is {name}{suffix}.")
+    _cache_put(key, line)
+    return line
 
 
 async def wikidata_sparql_line(office_en: str, place_en: str, timeout: float = 5.0,
@@ -1725,6 +1983,14 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
         jobs.append(wiki_lines(clean, timeout, limit=2))
         # Backup: 1 hafte ki khabrein (agar 2 din me kuch na ho).
         jobs.append(news_lines(clean, timeout, limit=2, freshness="7d"))
+    # Aaj ka match/score: sirf taaza khabar se (purana score nahi bolna hai).
+    if wants_sports_score(text):
+        jobs.append(news_lines(text, timeout, limit=3))
+    # Mantri wale sawaal: "List of ministers of <portfolio> of <state>" page se ABHI ka naam.
+    portfolio = portfolio_parts(text)
+    if portfolio:
+        jobs.append(portfolio_minister_line(portfolio[0], portfolio[1], timeout))
+        jobs.append(news_lines(f"{portfolio[1]} {portfolio[0]} minister", timeout, limit=2))
     if not jobs:  # koi khaas trigger nahi: Wikipedia facts
         jobs.append(wiki_lines(text, timeout))
     results = await asyncio.gather(*jobs, return_exceptions=True)
@@ -1738,7 +2004,17 @@ async def live_context(text: str, default_city: str, timeout: float = 8.0) -> st
     # Context chhota rakhte hain (prompt sasta, jawaab tez). Office sawaal me thoda bada,
     # kyunki wahan khabar ke headlines hi naam batate hain.
     budget = 7 if (wants_office(text) or wants_party(text)) else 5
-    lines = [ln for ln in lines if ln.strip()][:budget]
+    lines = [ln for ln in lines if ln.strip()]
+    # Sabse bharosemand lines pehle: "Live fact" (Wikipedia/Wikidata), phir "Reference", phir khabar.
+    def _rank(line: str) -> int:
+        low = line.lower()
+        if low.startswith("live fact"):
+            return 0
+        if low.startswith("reference"):
+            return 1
+        return 2
+    lines.sort(key=_rank)
+    lines = lines[:budget]
     return "\n".join(f"- {ln}" for ln in lines) if lines else None
 
 # ===================== merged from app/tts.py =====================
