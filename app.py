@@ -34,7 +34,7 @@ load_dotenv()
 
 # Ye version /health aur server page par dikhta hai - upload hua ya nahi, isse turant pata
 # chal jaata hai (Render purana code chala raha ho to yahi number purana dikhega).
-BUNDLE_VERSION = "2026-10-16-livefacts3"
+BUNDLE_VERSION = "2026-10-17-vc23"
 
 DEFAULT_SYSTEM_PROMPT = (
     # NEXORA ki personality + sakht rules. Yeh lines phone ke TTS voice ke liye likhi gayi
@@ -45,11 +45,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "1. Answer the user's real question in the FIRST sentence. Never dodge an answer or replace it "
     "with a joke.\n"
     "2. Stay very short: 1 or 2 sentences, at most about 25 words in total.\n"
-    "3. Answer in the SAME language the user spoke, and use that language's own script. You "
-    "understand and speak Indian languages such as Hindi, Hinglish, Bengali, Tamil, Telugu, "
-    "Marathi, Gujarati, Kannada, Malayalam, Punjabi, Odia and Urdu, plus English. If the user "
-    "spoke Hindi or Hinglish, answer in simple everyday Hindi using DEVANAGARI letters only, "
-    "with no Roman Hindi mixed in.\n"
+    "3. Language: ENGLISH is the default - English and Hinglish questions get an English answer "
+    "in Latin letters. If a language instruction is given below (for example the user asked for "
+    "Hindi or Tamil, or the question itself is written in Devanagari or another Indian script), "
+    "follow that instruction exactly and answer in that language's own script. You understand "
+    "and speak Hindi, Hinglish, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada, Malayalam, "
+    "Punjabi, Odia and Urdu, plus English. Never switch language on your own.\n"
     "4. No extra lines: no greeting at the start, no closing question, no offer of more help, no "
     "repeating the question, no stage directions in brackets.\n"
     "5. A light playful tone is welcome inside those 1-2 sentences, but for maths, definitions and "
@@ -2037,7 +2038,9 @@ logger = logging.getLogger("nexora.tts")
 # un bhashaon me server "no_voice" bhejta hai aur phone ki voice chalti hai.)
 VOICE_BY_LANGUAGE: dict[str, str] = {
     "hi": "hi-IN-MadhurNeural",          # Hindi male - "gehri bhaari aur cute"
-    "hinglish": "hi-IN-MadhurNeural",    # Hinglish jawaab Devanagari me likha jaata hai
+    # Hinglish ka jawaab Latin (English) akshar me hota hai, isliye Indian English male voice
+    # sahi lagti hai - Hindi voice Latin text ko ajeeb padhti hai.
+    "hinglish": "en-IN-PrabhatNeural",
     "en": "en-IN-PrabhatNeural",         # Indian English male
     "bn": "bn-IN-BashkarNeural",
     "ta": "ta-IN-ValluvarNeural",
@@ -2189,11 +2192,43 @@ def vision_provider():
 # Camera ke liye: tasveer dekh kar chhota, bolne layak jawaab. Guess nahi - sirf jo dikhe.
 VISION_PROMPT = (
     "\n\nThe user pointed your camera at something and asked: \"{question}\"\n"
-    "Look at the picture and answer: name the main thing you see, its colour, and one useful "
-    "detail, in your normal short spoken style. If the picture is dark, blurry or you are not "
-    "sure, say in one short sentence that you cannot see it clearly - never guess. Never say who "
-    "a person is. Follow the same length, language and no-emoji rules as before."
+    "Answer ONLY about the picture in front of you, in your normal short spoken style:\n"
+    "1. Name the main thing you actually see, its colour, and one useful detail. Examples: "
+    "\"Yeh ek laal seb hai, table par rakha hai\" or \"Yeh ek kitaab hai, neeli jild wali\".\n"
+    "2. Write what is REALLY in the photo. Do not add anything that is not visible - no invented "
+    "objects, no brand names, no names of people, no stories.\n"
+    "3. If the photo is dark, blurry, empty or you cannot make out the main thing clearly, say "
+    "honestly in ONE short sentence that you cannot see it properly (for example \"Mujhe theek se "
+    "nazar nahi aa raha, thoda saamne laao\"). Never guess and never describe a different thing.\n"
+    "4. If the question asks something about the photo (\"ye kya hai\", \"is ka rang kya hai\"), "
+    "answer that first; if the question cannot be answered from the photo, say so in one sentence.\n"
+    "5. Never say who a person is. Follow the same length, language and no-emoji rules as before."
 )
+
+
+# Phone batata hai kis script me jawaab chahiye ("en" / "hi" / "hinglish") - isse robot
+# apne aap Hindi (Devanagari) me switch nahi karta.
+_LANGUAGE_HINT_NOTE = {
+    "en": ("\n\nIMPORTANT: the user spoke ENGLISH. Write your answer in simple English using "
+           "Latin letters only. Do not answer in Hindi and do not use Devanagari letters."),
+    "hinglish": ("\n\nIMPORTANT: the user spoke Hinglish (Hindi words written in English letters). "
+                 "Write your answer in the same easy Hinglish style: Hindi words in Latin letters "
+                 "(like \"bilkul, main theek hoon\"). Never use Devanagari letters."),
+    "hi": ("\n\nIMPORTANT: the user spoke Hindi in Devanagari. Answer in simple everyday Hindi "
+           "using DEVANAGARI letters only - no Roman Hindi, no English sentences."),
+}
+
+
+def language_hint_note(hint: str | None) -> str:
+    """Phone ke batayi hui bhasha ka pakka niyam (khali ho to kuch nahi)."""
+    key = (hint or "").strip().lower()
+    if key.startswith("hing"):
+        return _LANGUAGE_HINT_NOTE["hinglish"]
+    if key.startswith("hi"):
+        return _LANGUAGE_HINT_NOTE["hi"]
+    if key.startswith("en"):
+        return _LANGUAGE_HINT_NOTE["en"]
+    return ""
 
 
 class VisionRequest(BaseModel):
@@ -2201,6 +2236,7 @@ class VisionRequest(BaseModel):
     image_b64: str = Field(min_length=200, max_length=2000000)
     session_id: str | None = Field(default=None, max_length=64)
     user_name: str | None = Field(default=None, max_length=40)
+    reply_language: str | None = Field(default=None, max_length=16)
 
 
 class ImageProblem(Exception):
@@ -2242,6 +2278,8 @@ class ChatRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     session_id: str | None = Field(default=None, max_length=64)
     user_name: str | None = Field(default=None, max_length=40)
+    # Phone ka bhasha hint: "en" / "hi" / "hinglish" (khaali bhi ho sakta hai).
+    reply_language: str | None = Field(default=None, max_length=16)
 
 
 def require_device(x_device_token: str | None = Header(default=None)) -> str:
@@ -2338,7 +2376,8 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
             logger.info("live info added (%d chars)", len(live))
 
     prompt = (settings.system_prompt + profile_note(request.user_name)
-              + (LIVE_PROMPT_SUFFIX.format(info=live) if live else ""))
+              + (LIVE_PROMPT_SUFFIX.format(info=live) if live else "")
+              + language_hint_note(getattr(request, "reply_language", None)))
     try:
         answer = await with_timeout(
             active.reply(prompt, messages), settings.request_timeout_s)
@@ -2431,6 +2470,7 @@ async def vision(request: VisionRequest, token: str = Depends(require_device)) -
 
     question = request.text.strip() or "Yeh kya hai?"
     prompt = (settings.system_prompt + VISION_PROMPT.format(question=question)
+              + language_hint_note(request.reply_language)
               + profile_note(request.user_name))
     session_id, _ = sessions.history(request.session_id)
     try:
