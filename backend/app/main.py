@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from .config import BUNDLE_VERSION, get_settings
 from .providers import (ProviderError, build_provider, build_vision_provider,
                         with_timeout)
-from .websearch import (live_context, wants_live_info, live_source_report, netcheck)
+from .websearch import (live_context, wants_live_info, wants_weather, live_source_report, netcheck)
 from .research import ResearchPacket, citation_spoken_suffix, collect_live_research
 from . import tts
 from .sessions import RateLimiter, SessionStore, guess_language
@@ -187,12 +187,20 @@ def profile_note(user_name: str | None) -> str:
             ". Use their name warmly once in a while, never in every sentence.")
 
 
+class ApproximateLocation(BaseModel):
+    """A rounded, transient phone location for one local-weather request; never stored."""
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
 class ChatRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     session_id: str | None = Field(default=None, max_length=64)
     user_name: str | None = Field(default=None, max_length=40)
     # Phone ka bhasha hint: "en" / "hi" / "hinglish" (khaali bhi ho sakta hai).
     reply_language: str | None = Field(default=None, max_length=16)
+    # Ignored except for a recognised current-weather request. Never put in history or logs.
+    location: ApproximateLocation | None = None
 
 
 def require_device(x_device_token: str | None = Header(default=None)) -> str:
@@ -294,10 +302,22 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
     # is not silently replaced by model memory: the phone receives an explicit uncertainty state.
     research_requested = settings.web_search and wants_live_info(text)
     research = ResearchPacket(False, "not_requested", None, (), None, None)
+    # Stage F privacy boundary: location is useful only for live weather. It is rounded again
+    # server-side, passed to Open-Meteo without an address lookup, and never saved/logged.
+    approximate_location: tuple[float, float] | None = None
+    if request.location is not None and wants_weather(text):
+        approximate_location = (round(request.location.latitude, 2), round(request.location.longitude, 2))
     if research_requested:
+        # Preserve the ordinary three-argument collector path unless the client explicitly
+        # supplied a weather-only approximate location. This also keeps named-city weather simple.
+        collect_context = live_context
+        if approximate_location is not None:
+            async def location_weather_context(question: str, city: str, timeout: float) -> str | None:
+                return await live_context(question, city, timeout, approximate_location=approximate_location)
+            collect_context = location_weather_context
         try:
             research = await asyncio.wait_for(
-                collect_live_research(text, settings.city, settings.search_timeout_s, live_context),
+                collect_live_research(text, settings.city, settings.search_timeout_s, collect_context),
                 timeout=settings.search_timeout_s + 5.0,
             )
         except Exception:  # bounded research must never expose internal failures to the phone
@@ -484,15 +504,15 @@ async def home() -> HTMLResponse:
     except ProviderError:
         ready = False
     dot = "#16a34a" if ready else "#dc2626"
-    state = "AI BRAIN READY - bol ke dekho!" if ready else "AI key nahi mili - Render -> Environment me key daalo"
+    state = "AI BRAIN READY — ask NEX a question." if ready else "AI key is missing — add it in Render Environment."
     live = "ON" if settings.web_search else "OFF"
     eyes = "ON" if settings.vision_enabled else "OFF"
     voice = "ON (male neural)" if settings.tts_enabled else "OFF"
-    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>NEXORA server</title></head>
+    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>NEX server</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b1020;color:#e5e7eb;text-align:center;padding:40px">
-<h1 style="margin:0 0 6px">NEXORA server chal raha hai</h1>
+<h1 style="margin:0 0 6px">NEX server is running</h1>
 <p style="opacity:.7;margin:0 0 26px">provider: {settings.provider} &nbsp;|&nbsp; model: {settings.provider_model} &nbsp;|&nbsp; web search: {live} &nbsp;|&nbsp; camera vision: {eyes} &nbsp;|&nbsp; voice: {voice} &nbsp;|&nbsp; languages: 13</p>
 <p style="font-size:20px"><span style="color:{dot};font-size:28px">&#9679;</span> {state}</p>
-<p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> par poora status JSON milta hai</p>
+<p style="opacity:.6;margin-top:30px"><a style="color:#7dd3fc" href="/health">/health</a> shows the full status JSON</p>
 </body></html>"""
     return HTMLResponse(html)

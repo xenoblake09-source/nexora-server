@@ -427,6 +427,40 @@ async def weather_line(city: str, timeout: float) -> str | None:
     return None
 
 
+async def weather_line_coordinates(latitude: float, longitude: float, timeout: float) -> str | None:
+    """Weather for an explicit, already-coarsened device location.
+
+    This deliberately avoids reverse geocoding: NEX neither learns nor stores an address. The
+    caller rounds coordinates again before reaching this function, and the answer is labelled as
+    approximate local weather rather than a city name.
+    """
+    if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0):
+        return None
+    latitude, longitude = round(latitude, 2), round(longitude, 2)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                     headers={"User-Agent": "NEX/1.4 location-weather"}) as client:
+            await _be_polite()
+            fc = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
+                    "daily": "temperature_2m_max,temperature_2m_min",
+                    "timezone": "auto",
+                    "forecast_days": 1,
+                },
+            )
+            data = fc.json() or {}
+            text = weather_text("Approximate local weather", data.get("current") or {}, data.get("daily") or {})
+            if text:
+                return f"Live weather (Open-Meteo): {text}"
+    except Exception:  # noqa: BLE001 - never replace missing local weather with a guess
+        pass
+    return None
+
+
 async def news_lines(query: str, timeout: float, limit: int = 4,
                       freshness: str = "2d") -> list[str]:
     """Google News RSS - aaj ki khabrein. Koi key nahi chahiye."""
@@ -1291,11 +1325,15 @@ async def live_source_report(text: str, default_city: str, timeout: float = 8.0,
     return report
 
 
-async def live_context(text: str, default_city: str, timeout: float = 8.0) -> str | None:
+async def live_context(text: str, default_city: str, timeout: float = 8.0,
+                       approximate_location: tuple[float, float] | None = None) -> str | None:
     """Sawaal ke hisaab se taaza jaankari laao. Kuch na mile to None."""
     jobs = []
     if wants_weather(text):
-        jobs.append(weather_line(city_from_text(text, default_city), timeout))
+        if approximate_location is not None:
+            jobs.append(weather_line_coordinates(approximate_location[0], approximate_location[1], timeout))
+        else:
+            jobs.append(weather_line(city_from_text(text, default_city), timeout))
     if wants_news(text):
         jobs.append(news_lines(text, timeout))
         # Chunav/election wale sawaal: English keyword + 30 din ki khabrein (result purana

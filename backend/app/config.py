@@ -10,7 +10,7 @@ load_dotenv()
 
 # Ye version /health aur server page par dikhta hai - upload hua ya nahi, isse turant pata
 # chal jaata hai (Render purana code chala raha ho to yahi number purana dikhega).
-BUNDLE_VERSION = "2026-10-29-stage-e-research"
+BUNDLE_VERSION = "2026-10-29-stage-f-location"
 
 DEFAULT_SYSTEM_PROMPT = (
     # NEXORA ki personality + sakht rules. Yeh lines phone ke TTS voice ke liye likhi gayi
