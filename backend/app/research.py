@@ -73,6 +73,16 @@ def citations_for_context(context: str | None, retrieved_at: str | None = None) 
             discovered.append(("Open-Meteo", "https://open-meteo.com/", "weather", True, "high"))
         elif "live weather (wttr.in)" in line:
             discovered.append(("wttr.in", "https://wttr.in/", "weather", True, "medium"))
+        elif line.lstrip("- ").startswith("official https school website (montfort school information)"):
+            discovered.append(("Montfort Official Website", "https://montfortbagaha.org/school-information/", "school", False, "medium"))
+        elif line.lstrip("- ").startswith("official https school website (montfort contact)"):
+            discovered.append(("Montfort Official Website", "https://montfortbagaha.org/contact/", "school", False, "medium"))
+        elif line.lstrip("- ").startswith("official https school website (montfort principal"):
+            discovered.append(("Montfort Official Website", "https://montfortbagaha.org/principals-desk/", "school", False, "medium"))
+        elif line.lstrip("- ").startswith("authorised school document ("):
+            # Documents are reviewed public-only extracts with a SHA-256 verified manifest entry.
+            # They may have no public web URL, so the Android app renders a label but never opens one.
+            discovered.append(("Authorised School Document", "", "school_document", False, "high"))
 
     citations: list[Citation] = []
     seen: set[str] = set()
@@ -103,7 +113,11 @@ async def collect_live_research(
         context = None
     citations = citations_for_context(context, stamp)
     if context and citations:
-        return ResearchPacket(True, "verified", context, citations, None, stamp)
+        uncertainty = None
+        if any(citation.source_type in {"school", "school_document"} for citation in citations):
+            uncertainty = ("Authorised school source retrieved; NEX does not treat an expired or "
+                           "missing source as proof of current staff, schedules, or private student information.")
+        return ResearchPacket(True, "verified", context, citations, uncertainty, stamp)
     return ResearchPacket(
         True,
         "unavailable",

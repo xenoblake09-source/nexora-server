@@ -15,10 +15,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .config import BUNDLE_VERSION, get_settings
+from .config import BUNDLE_VERSION, SCHOOL_RETRIEVAL_BUNDLE, get_settings
 from .providers import (ProviderError, build_provider, build_vision_provider,
                         with_timeout)
 from .websearch import (live_context, wants_live_info, wants_weather, live_source_report, netcheck)
+from .school import school_context, wants_school_info
 from .research import ResearchPacket, citation_spoken_suffix, collect_live_research
 from . import tts
 from .sessions import RateLimiter, SessionStore, guess_language
@@ -78,6 +79,7 @@ LIVE_PROMPT_SUFFIX = (
 )
 
 LIVE_UNAVAILABLE_REPLY = "I could not verify current information right now, so I will not guess."
+SCHOOL_UNAVAILABLE_REPLY = "I could not verify that school information from an authorised source, so I will not guess."
 
 
 def vision_provider():
@@ -273,6 +275,7 @@ async def health() -> dict:
         "brain_ready": ready,
         "tokens_configured": bool(settings.device_tokens),
         "bundle": BUNDLE_VERSION,
+        "school_retrieval_bundle": SCHOOL_RETRIEVAL_BUNDLE,
         "vision": settings.vision_enabled,
         "speech": settings.tts_enabled,
         "speech_voices": sorted(tts.VOICE_BY_LANGUAGE),
@@ -300,7 +303,10 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
 
     # Current-information requests get a bounded, allowlisted research packet. A source failure
     # is not silently replaced by model memory: the phone receives an explicit uncertainty state.
-    research_requested = settings.web_search and wants_live_info(text)
+    # Stage G school facts use only the user-authorised, fixed public school pages. School
+    # questions are source-required even if ordinary live web search is disabled.
+    school_requested = wants_school_info(text)
+    research_requested = school_requested or (settings.web_search and wants_live_info(text))
     research = ResearchPacket(False, "not_requested", None, (), None, None)
     # Stage F privacy boundary: location is useful only for live weather. It is rounded again
     # server-side, passed to Open-Meteo without an address lookup, and never saved/logged.
@@ -311,7 +317,11 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
         # Preserve the ordinary three-argument collector path unless the client explicitly
         # supplied a weather-only approximate location. This also keeps named-city weather simple.
         collect_context = live_context
-        if approximate_location is not None:
+        if school_requested:
+            async def school_research_context(question: str, _city: str, timeout: float) -> str | None:
+                return await school_context(question, timeout)
+            collect_context = school_research_context
+        elif approximate_location is not None:
             async def location_weather_context(question: str, city: str, timeout: float) -> str | None:
                 return await live_context(question, city, timeout, approximate_location=approximate_location)
             collect_context = location_weather_context
@@ -326,7 +336,7 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
                 "Live research timed out or returned no recognised source.", None,
             )
         if research.status == "unavailable": 
-            answer = LIVE_UNAVAILABLE_REPLY
+            answer = SCHOOL_UNAVAILABLE_REPLY if school_requested else LIVE_UNAVAILABLE_REPLY
             sessions.append(session_id, "user", text)
             sessions.append(session_id, "assistant", answer)
             logger.info("live research unavailable session=%s", session_id[:8])
