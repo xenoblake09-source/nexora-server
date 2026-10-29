@@ -1,0 +1,3 @@
+# Developer-only tools (server chalane ke liye zaroori nahi)
+-r requirements.txt
+pytest==9.0.3

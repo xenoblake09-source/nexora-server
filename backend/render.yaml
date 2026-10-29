@@ -1,0 +1,28 @@
+# Render.com blueprint example (optional hosting helper).
+# Yeh file Render ke "Blueprint" se seedha deploy karne ke liye hai.
+# Secrets (GEMINI_API_KEY, DEVICE_TOKENS) dashboard me daalna — yahan kabhi mat likhna.
+# Kisi bhi host ka dashboard/fields badal sakte hain, isliye deploy ke waqt apne host ke
+# current docs dekh lena.
+services:
+  - type: web
+    name: nexora-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.0"
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_API_KEY
+        sync: false          # dashboard me apni key daalo
+      - key: DEVICE_TOKENS
+        sync: false          # dashboard me apna token daalo
+      - key: RATE_PER_MINUTE
+        value: "12"
+      - key: RATE_PER_DAY
+        value: "300"
