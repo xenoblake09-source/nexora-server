@@ -15,12 +15,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .config import BUNDLE_VERSION, SCHOOL_RETRIEVAL_BUNDLE, get_settings
+from .config import (BUNDLE_VERSION, QUIET_SOURCES_BUNDLE, SCHOOL_RETRIEVAL_BUNDLE,
+                     get_settings)
 from .providers import (ProviderError, build_provider, build_vision_provider,
                         with_timeout)
 from .websearch import (live_context, wants_live_info, wants_weather, live_source_report, netcheck)
 from .school import school_context, wants_school_info
-from .research import ResearchPacket, citation_spoken_suffix, collect_live_research
+from .research import ResearchPacket, collect_live_research
 from . import tts
 from .sessions import RateLimiter, SessionStore, guess_language
 
@@ -69,17 +70,20 @@ def clean_reply(text: str) -> str:
     return cleaned[:600].strip()
 
 
-# A bounded, cited live-research packet is appended only after a recognised source responded.
+# A bounded, verified live-research packet is appended only after a recognised source responded.
+# Provenance remains in response metadata for the app, but the user requested source wording not
+# be spoken aloud, so the prompt prohibits source names/citations/URLs in the reply itself.
 LIVE_PROMPT_SUFFIX = (
     "\n\nVERIFIED LIVE RESEARCH PACKET:\n{info}\n"
     "Answer the current part of the user's question only from this packet. Do not add dates, "
     "names, numbers, office holders, scores, weather details, or claims that are absent from it. "
-    "If the packet is incomplete, say briefly what could not be verified. Do not invent citations "
-    "or claim another source. The server will attach the approved source metadata separately."
+    "If the packet is incomplete, say briefly what could not be verified. Do not mention source "
+    "names, citations, URLs, or say that an answer came from a source in the spoken reply. "
+    "Approved provenance metadata is attached separately for the app."
 )
 
 LIVE_UNAVAILABLE_REPLY = "I could not verify current information right now, so I will not guess."
-SCHOOL_UNAVAILABLE_REPLY = "I could not verify that school information from an authorised source, so I will not guess."
+SCHOOL_UNAVAILABLE_REPLY = "I could not verify that school information, so I will not guess."
 
 
 def vision_provider():
@@ -276,6 +280,7 @@ async def health() -> dict:
         "tokens_configured": bool(settings.device_tokens),
         "bundle": BUNDLE_VERSION,
         "school_retrieval_bundle": SCHOOL_RETRIEVAL_BUNDLE,
+        "quiet_sources_bundle": QUIET_SOURCES_BUNDLE,
         "vision": settings.vision_enabled,
         "speech": settings.tts_enabled,
         "speech_voices": sorted(tts.VOICE_BY_LANGUAGE),
@@ -379,7 +384,8 @@ async def chat(request: ChatRequest, token: str = Depends(require_device)) -> di
         logger.exception("unexpected provider error")
         raise HTTPException(status_code=502, detail="provider_error") from None
 
-    answer = clean_reply(answer.strip() + citation_spoken_suffix(research))
+    # Keep verified provenance in the structured response, never as an automatic spoken suffix.
+    answer = clean_reply(answer.strip())
     if not answer:
         raise HTTPException(status_code=502, detail="provider_empty")
 

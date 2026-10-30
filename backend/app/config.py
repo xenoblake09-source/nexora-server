@@ -14,6 +14,8 @@ load_dotenv()
 # guard. Stage G is separately advertised in /health as school_retrieval_bundle.
 BUNDLE_VERSION = "2026-10-29-stage-f-location"
 SCHOOL_RETRIEVAL_BUNDLE = "2026-10-29-stage-g-school-retrieval"
+# Stage I keeps source verification in metadata but removes deterministic spoken-source labels.
+QUIET_SOURCES_BUNDLE = "2026-10-30-stage-i-quiet-sources"
 
 DEFAULT_SYSTEM_PROMPT = (
     # NEXORA ki personality + sakht rules. Yeh lines phone ke TTS voice ke liye likhi gayi

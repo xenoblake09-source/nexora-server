@@ -126,11 +126,3 @@ async def collect_live_research(
         "No recognised current source responded, so NEX did not answer from static memory.",
         stamp,
     )
-
-
-def citation_spoken_suffix(packet: ResearchPacket) -> str:
-    """Short deterministic spoken citation, independent of model compliance."""
-    if packet.status != "verified" or not packet.citations:
-        return ""
-    labels = ", ".join(item.title for item in packet.citations[:2])
-    return f" Source: {labels}."
